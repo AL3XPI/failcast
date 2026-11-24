@@ -1,0 +1,11 @@
+[package]
+name = "pts-store"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pts-core = { workspace = true }
+rusqlite = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

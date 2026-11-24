@@ -1,0 +1,40 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/pts-core",
+    "crates/pts-store",
+    "crates/pts-collectors",
+    "crates/pts-ml",
+    "crates/pts-runners",
+    "crates/pts-eval",
+    "crates/pts-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+assert_cmd = "2"
+clap = { version = "4", features = ["derive"] }
+predicates = "3"
+quick-xml = "0.37"
+rusqlite = { version = "0.34", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+pts-core = { path = "crates/pts-core" }
+pts-store = { path = "crates/pts-store" }
+pts-collectors = { path = "crates/pts-collectors" }
+pts-ml = { path = "crates/pts-ml" }
+pts-runners = { path = "crates/pts-runners" }
+pts-eval = { path = "crates/pts-eval" }

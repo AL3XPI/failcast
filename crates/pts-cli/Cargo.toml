@@ -1,0 +1,26 @@
+[package]
+name = "pts-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "pts"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+pts-core = { workspace = true }
+pts-runners = { workspace = true }
+pts-store = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = { workspace = true }
+predicates = { workspace = true }
+rusqlite = { workspace = true }
+tempfile = { workspace = true }

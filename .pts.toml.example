@@ -1,0 +1,8 @@
+runner = "pytest"
+default_budget_secs = 15
+explore_fraction = 0.10
+min_failures_for_ml = 25
+min_runs_for_ml = 100
+history_commit_limit = 500
+pytest_bin = "pytest"
+max_traceback_chars = 1500

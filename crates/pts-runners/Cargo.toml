@@ -1,0 +1,10 @@
+[package]
+name = "pts-runners"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pts-core = { workspace = true }
+quick-xml = { workspace = true }
+tempfile = { workspace = true }
+tracing = { workspace = true }
