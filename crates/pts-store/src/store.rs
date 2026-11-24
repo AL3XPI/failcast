@@ -4,8 +4,8 @@ use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use pts_core::{
-    CoFailCounts, CommitRecord, DiffFile, HistorySnapshot, PtsError, RunMode, SelectionReason,
-    TestCase, TestHistory, TestStatus,
+    CoFailCounts, CommitRecord, DiffFile, HistoricalOutcome, HistoricalRun, HistorySnapshot,
+    PtsError, RunMode, SelectionReason, TestCase, TestHistory, TestStatus,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -49,6 +49,19 @@ pub struct TestRecord {
     pub first_seen_ts: i64,
     pub last_seen_ts: i64,
     pub active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelRecord {
+    pub model_id: String,
+    pub trained_at: i64,
+    pub max_train_ts: i64,
+    pub train_rows: usize,
+    pub pos_rows: usize,
+    pub brier_score: f64,
+    pub calibration_a: f64,
+    pub calibration_b: f64,
+    pub artifact_path: String,
 }
 
 pub struct Store {
@@ -794,6 +807,273 @@ impl Store {
         }
 
         Ok(snapshot)
+    }
+
+    /// Inserts a trained model metadata record into the `models` table.
+    pub fn insert_model(&self, model: &ModelRecord) -> Result<(), PtsError> {
+        self.conn
+            .execute(
+                "
+                INSERT INTO models (
+                    model_id, trained_at, max_train_ts, train_rows, pos_rows,
+                    brier_score, calibration_a, calibration_b, artifact_path
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                ",
+                params![
+                    model.model_id,
+                    model.trained_at,
+                    model.max_train_ts,
+                    model.train_rows as i64,
+                    model.pos_rows as i64,
+                    model.brier_score,
+                    model.calibration_a,
+                    model.calibration_b,
+                    model.artifact_path,
+                ],
+            )
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    /// Returns the most recently trained model metadata record, if any.
+    pub fn get_latest_model(&self) -> Result<Option<ModelRecord>, PtsError> {
+        self.conn
+            .query_row(
+                "
+                SELECT model_id, trained_at, max_train_ts, train_rows, pos_rows,
+                       brier_score, calibration_a, calibration_b, artifact_path
+                FROM models
+                ORDER BY trained_at DESC, rowid DESC
+                LIMIT 1
+                ",
+                [],
+                |r| {
+                    Ok(ModelRecord {
+                        model_id: r.get(0)?,
+                        trained_at: r.get(1)?,
+                        max_train_ts: r.get(2)?,
+                        train_rows: r.get::<_, i64>(3)?.max(0) as usize,
+                        pos_rows: r.get::<_, i64>(4)?.max(0) as usize,
+                        brier_score: r.get(5)?,
+                        calibration_a: r.get(6)?,
+                        calibration_b: r.get(7)?,
+                        artifact_path: r.get(8)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(store_err)
+    }
+
+    /// Loads all historical runs in strict chronological order `(started_at ASC, run_id ASC)`
+    /// along with their diff files and test outcomes.
+    pub fn load_historical_runs(&self) -> Result<Vec<HistoricalRun>, PtsError> {
+        let mut runs: Vec<HistoricalRun> = Vec::new();
+        let mut run_index: BTreeMap<String, usize> = BTreeMap::new();
+
+        {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "
+                    SELECT run_id, commit_sha, diff_fingerprint, started_at
+                    FROM runs
+                    ORDER BY started_at ASC, run_id ASC
+                    ",
+                )
+                .map_err(store_err)?;
+
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                })
+                .map_err(store_err)?;
+
+            for row in rows {
+                let (run_id, commit_sha, diff_fingerprint, started_at) = row.map_err(store_err)?;
+                let idx = runs.len();
+                run_index.insert(run_id.clone(), idx);
+                runs.push(HistoricalRun {
+                    run_id,
+                    commit_sha,
+                    diff_fingerprint,
+                    started_at,
+                    diff_files: Vec::new(),
+                    outcomes: Vec::new(),
+                });
+            }
+        }
+
+        if runs.is_empty() {
+            return Ok(runs);
+        }
+
+        {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "
+                    SELECT run_id, file_path, lines_added, lines_deleted
+                    FROM run_diff_files
+                    ORDER BY run_id ASC, file_path ASC
+                    ",
+                )
+                .map_err(store_err)?;
+
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                })
+                .map_err(store_err)?;
+
+            for row in rows {
+                let (run_id, path, lines_added, lines_deleted) = row.map_err(store_err)?;
+                if let Some(&idx) = run_index.get(&run_id) {
+                    runs[idx].diff_files.push(DiffFile {
+                        path,
+                        lines_added: lines_added.max(0) as u32,
+                        lines_deleted: lines_deleted.max(0) as u32,
+                    });
+                }
+            }
+        }
+
+        {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "
+                    SELECT o.run_id, o.test_id, t.file_path, o.status, o.duration_ms, o.sampling_propensity
+                    FROM test_outcomes o
+                    JOIN tests t ON t.test_id = o.test_id
+                    ORDER BY o.run_id ASC, o.test_id ASC
+                    ",
+                )
+                .map_err(store_err)?;
+
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, i64>(4)?,
+                        r.get::<_, f64>(5)?,
+                    ))
+                })
+                .map_err(store_err)?;
+
+            for row in rows {
+                let (run_id, test_id, file_path, status_str, duration_ms, sampling_propensity) =
+                    row.map_err(store_err)?;
+                if let Some(&idx) = run_index.get(&run_id) {
+                    runs[idx].outcomes.push(HistoricalOutcome {
+                        test_id,
+                        file_path,
+                        status: TestStatus::from_str(&status_str)?,
+                        duration_ms: duration_ms.max(0) as u64,
+                        sampling_propensity,
+                        ast_min_hop: None,
+                    });
+                }
+            }
+        }
+
+        Ok(runs)
+    }
+
+    /// Loads all mined git commits ordered chronologically ascending by `(commit_ts, commit_sha)`.
+    pub fn load_commits(&self) -> Result<Vec<CommitRecord>, PtsError> {
+        let mut commits: Vec<CommitRecord> = Vec::new();
+        let mut commit_index: BTreeMap<String, usize> = BTreeMap::new();
+
+        {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "
+                    SELECT commit_sha, parent_sha, author_hash, commit_ts,
+                           files_changed, lines_added, lines_deleted
+                    FROM commits
+                    ORDER BY commit_ts ASC, commit_sha ASC
+                    ",
+                )
+                .map_err(store_err)?;
+
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok(CommitRecord {
+                        commit_sha: r.get(0)?,
+                        parent_sha: r.get(1)?,
+                        author_hash: r.get(2)?,
+                        commit_ts: r.get(3)?,
+                        files_changed: r.get::<_, i64>(4)?.max(0) as u32,
+                        lines_added: r.get::<_, i64>(5)?.max(0) as u32,
+                        lines_deleted: r.get::<_, i64>(6)?.max(0) as u32,
+                        files: Vec::new(),
+                    })
+                })
+                .map_err(store_err)?;
+
+            for row in rows {
+                let commit = row.map_err(store_err)?;
+                let idx = commits.len();
+                commit_index.insert(commit.commit_sha.clone(), idx);
+                commits.push(commit);
+            }
+        }
+
+        if commits.is_empty() {
+            return Ok(commits);
+        }
+
+        {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "
+                    SELECT commit_sha, file_path, lines_added, lines_deleted
+                    FROM commit_files
+                    ORDER BY commit_sha ASC, file_path ASC
+                    ",
+                )
+                .map_err(store_err)?;
+
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                })
+                .map_err(store_err)?;
+
+            for row in rows {
+                let (sha, path, lines_added, lines_deleted) = row.map_err(store_err)?;
+                if let Some(&idx) = commit_index.get(&sha) {
+                    commits[idx].files.push(DiffFile {
+                        path,
+                        lines_added: lines_added.max(0) as u32,
+                        lines_deleted: lines_deleted.max(0) as u32,
+                    });
+                }
+            }
+        }
+
+        Ok(commits)
     }
 }
 

@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use pts_core::{CommitRecord, DiffFile, DiffSummary, PtsError, normalize_posix_path};
 use sha2::{Digest, Sha256};
+use tempfile::TempDir;
 
 const COMMIT_MARKER: &str = "---PTS-COMMIT---";
 
@@ -67,6 +68,17 @@ pub fn extract_working_diff(repo_root: &Path) -> Result<DiffSummary, PtsError> {
 /// Mines up to `limit` commits from `git log` returning commit metadata, hashed author IDs,
 /// and per-file line diff statistics.
 pub fn mine_commit_history(repo_root: &Path, limit: usize) -> Result<Vec<CommitRecord>, PtsError> {
+    mine_commit_history_from_ref(repo_root, "HEAD", limit)
+}
+
+/// Mines up to `limit` first-parent commits starting from `git_ref`, returning commit
+/// metadata, hashed author IDs, and per-file line diff statistics against each commit's
+/// first parent. Returned in newest-first (`git log`) order.
+pub fn mine_commit_history_from_ref(
+    repo_root: &Path,
+    git_ref: &str,
+    limit: usize,
+) -> Result<Vec<CommitRecord>, PtsError> {
     if limit == 0 {
         return Ok(Vec::new());
     }
@@ -78,7 +90,7 @@ pub fn mine_commit_history(repo_root: &Path, limit: usize) -> Result<Vec<CommitR
         )));
     }
 
-    if resolve_head_sha(repo_root)?.is_none() {
+    if git_ref == "HEAD" && resolve_head_sha(repo_root)?.is_none() {
         return Ok(Vec::new());
     }
 
@@ -88,11 +100,14 @@ pub fn mine_commit_history(repo_root: &Path, limit: usize) -> Result<Vec<CommitR
             "-c",
             "core.quotepath=false",
             "log",
+            "-m",
+            "--first-parent",
             "-n",
             &limit.to_string(),
             "--no-renames",
             "--numstat",
             &format_arg,
+            git_ref,
         ])
         .current_dir(repo_root)
         .output()?;
@@ -108,6 +123,88 @@ pub fn mine_commit_history(repo_root: &Path, limit: usize) -> Result<Vec<CommitR
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     parse_git_log_output(&stdout)
+}
+
+/// RAII temporary detached `git worktree` that isolates historical checkouts from the
+/// user's working tree and always removes/prunes the worktree on `Drop`.
+pub struct TempGitWorktree {
+    repo_root: PathBuf,
+    worktree_path: PathBuf,
+    _tempdir: TempDir,
+}
+
+impl TempGitWorktree {
+    pub fn create(repo_root: &Path, commit_sha: &str) -> Result<Self, PtsError> {
+        if !is_git_repo(repo_root) {
+            return Err(PtsError::Runner(format!(
+                "{} is not a git repository",
+                repo_root.display()
+            )));
+        }
+
+        let tempdir = tempfile::tempdir()?;
+        let worktree_path = tempdir.path().join("worktree");
+        let wt_str = worktree_path.to_string_lossy().to_string();
+
+        let output = Command::new("git")
+            .args(["worktree", "add", "--detach", &wt_str, commit_sha])
+            .current_dir(repo_root)
+            .output()?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(PtsError::Runner(format!(
+                "git worktree add failed for {commit_sha}: {}",
+                stderr.trim()
+            )));
+        }
+
+        Ok(Self {
+            repo_root: repo_root.to_path_buf(),
+            worktree_path,
+            _tempdir: tempdir,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.worktree_path
+    }
+
+    pub fn checkout(&self, commit_sha: &str) -> Result<(), PtsError> {
+        let output = Command::new("git")
+            .args(["checkout", "--detach", "--force", commit_sha])
+            .current_dir(&self.worktree_path)
+            .output()?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(PtsError::Runner(format!(
+                "git checkout failed in worktree for {commit_sha}: {}",
+                stderr.trim()
+            )));
+        }
+
+        let _ = Command::new("git")
+            .args(["clean", "-fd"])
+            .current_dir(&self.worktree_path)
+            .output();
+
+        Ok(())
+    }
+}
+
+impl Drop for TempGitWorktree {
+    fn drop(&mut self) {
+        let wt_str = self.worktree_path.to_string_lossy().to_string();
+        let _ = Command::new("git")
+            .args(["worktree", "remove", "--force", &wt_str])
+            .current_dir(&self.repo_root)
+            .output();
+        let _ = Command::new("git")
+            .args(["worktree", "prune"])
+            .current_dir(&self.repo_root)
+            .output();
+    }
 }
 
 fn resolve_head_sha(repo_root: &Path) -> Result<Option<String>, PtsError> {

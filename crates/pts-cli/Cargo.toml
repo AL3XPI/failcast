@@ -12,6 +12,7 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 pts-collectors = { workspace = true }
 pts-core = { workspace = true }
+pts-eval = { workspace = true }
 pts-ml = { workspace = true }
 pts-runners = { workspace = true }
 pts-store = { workspace = true }

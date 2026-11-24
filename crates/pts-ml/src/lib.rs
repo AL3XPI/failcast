@@ -1,14 +1,26 @@
-//! Pure feature engineering, cold-start heuristic ranker, and cost-aware selector.
+//! Pure feature engineering, cold-start heuristic ranker, GBDT trainer, Platt calibrator,
+//! and cost-aware selector.
 //!
 //! Invariant 2: This crate is 100% pure — no disk I/O, no subprocesses, no DB,
 //! and no `SystemTime::now()` calls.
 
+pub mod accumulator;
 pub mod features;
+pub mod gbdt;
 pub mod heuristic;
+pub mod platt;
 pub mod selector;
 
+pub use accumulator::{HistoryAccumulator, TrainingRow};
 pub use features::{FEATURE_NAMES, NUM_FEATURES, extract_features};
+pub use gbdt::{
+    BOOSTER_PREDICTS_RAW_MARGINS, ChronologicalSplit, GBDT_ITERATIONS, GBDT_L2,
+    GBDT_LEARNING_RATE, GBDT_MAX_DEPTH, GBDT_MIN_LEAF_WEIGHT, GBDT_SEED, MODEL_ARTIFACT_VERSION,
+    ModelArtifact, TrainResult, TrainedModel, build_chronological_split, build_default_booster,
+    inverse_propensity_weight, normalize_to_log_odds, to_column_major, train_gbdt_model,
+};
 pub use heuristic::{ast_hop_decay, score_heuristic, should_use_heuristic};
+pub use platt::{PlattCalibrator, brier_score, logit, sigmoid};
 pub use selector::{
     CandidateTest, DEFAULT_MEDIAN_DURATION_MS, MIN_EFF_DURATION_MS, SelectedTest,
     SelectionStrategy, select_tests,
@@ -331,5 +343,362 @@ pub mod tests {
         assert_eq!(recall_sel.len(), 2);
         assert_eq!(recall_sel[0].test_id, "tests/test_a.py::test_1");
         assert_eq!(recall_sel[1].test_id, "tests/test_b.py::test_2");
+    }
+
+    fn make_synthetic_runs(num_runs: usize) -> Vec<pts_core::HistoricalRun> {
+        use pts_core::{DiffFile, HistoricalOutcome, HistoricalRun, TestStatus};
+
+        let mut runs = Vec::with_capacity(num_runs);
+        for r in 0..num_runs {
+            let started_at = 1_700_000_000 + (r as i64) * 3600;
+            let mod_idx = r % 3;
+            let diff_file = format!("src/mod_{mod_idx}.py");
+            let is_bug = r % 2 == 1;
+            let diff_files = vec![DiffFile {
+                path: diff_file.clone(),
+                lines_added: if is_bug { 25 } else { 4 },
+                lines_deleted: if is_bug { 8 } else { 1 },
+            }];
+            let fp = DiffSummary::compute_fingerprint(&diff_files);
+
+            let mut outcomes = Vec::new();
+            for t in 0..6 {
+                let test_mod = t / 2;
+                let file_path = format!("tests/test_mod_{test_mod}.py");
+                let test_id = format!("{file_path}::test_{t}");
+                let coupled = test_mod == mod_idx;
+                let status = if t == 5 && r % 5 == 0 {
+                    TestStatus::Skip
+                } else if is_bug && coupled && t % 2 == 0 {
+                    TestStatus::Fail
+                } else {
+                    TestStatus::Pass
+                };
+                outcomes.push(HistoricalOutcome {
+                    test_id,
+                    file_path,
+                    status,
+                    duration_ms: 100 + (t as u64) * 25,
+                    sampling_propensity: if t % 3 == 0 { 0.5 } else { 1.0 },
+                    ast_min_hop: if coupled { Some(1) } else { None },
+                });
+            }
+
+            runs.push(HistoricalRun {
+                run_id: format!("run-{r:04}"),
+                commit_sha: Some(format!("sha-{r:04}")),
+                diff_fingerprint: fp,
+                started_at,
+                diff_files,
+                outcomes,
+            });
+        }
+        runs
+    }
+
+    #[test]
+    fn column_major_layout_and_booster_determinism() {
+        // 1. Verify to_column_major exact indexing: out[col * num_rows + row] == rows[row][col].
+        let mut row0 = [0.0; NUM_FEATURES];
+        let mut row1 = [0.0; NUM_FEATURES];
+        let mut row2 = [0.0; NUM_FEATURES];
+        for c in 0..NUM_FEATURES {
+            row0[c] = (c as f64) + 0.1;
+            row1[c] = (c as f64) + 100.2;
+            row2[c] = if c == 0 { f64::NAN } else { (c as f64) + 200.3 };
+        }
+        let rows = [row0, row1, row2];
+        let col_major = to_column_major(&rows);
+        assert_eq!(col_major.len(), rows.len() * NUM_FEATURES);
+        for (r_idx, row) in rows.iter().enumerate() {
+            for (c_idx, &expected) in row.iter().enumerate() {
+                let actual = col_major[c_idx * rows.len() + r_idx];
+                if expected.is_nan() {
+                    assert!(actual.is_nan(), "expected NaN at ({r_idx}, {c_idx})");
+                } else {
+                    assert_eq!(
+                        actual.to_bits(),
+                        expected.to_bits(),
+                        "mismatch at ({r_idx}, {c_idx})"
+                    );
+                }
+            }
+        }
+
+        // 2. Verify forust-ml LogLoss booster outputs raw log-odds margins (values < 0.0 and > 1.0).
+        let runs = make_synthetic_runs(30);
+        let res1 = train_gbdt_model(&runs, &[], 1_700_500_000).expect("first training");
+        let res2 = train_gbdt_model(&runs, &[], 1_700_500_000).expect("second training");
+
+        let probe_rows: Vec<[f64; NUM_FEATURES]> =
+            HistoryAccumulator::build_dataset(&runs, &[])
+                .into_iter()
+                .map(|r| r.features)
+                .collect();
+
+        let raw_margins = res1.model.predict_raw_margins(&probe_rows);
+        assert!(
+            raw_margins.iter().any(|&z| z < 0.0),
+            "expected negative raw log-odds margins from LogLoss booster, got range [{:?}, {:?}]",
+            raw_margins.iter().copied().reduce(f64::min),
+            raw_margins.iter().copied().reduce(f64::max),
+        );
+        assert!(
+            raw_margins.iter().any(|&z| z > 1.0) || raw_margins.iter().any(|&z| z < -1.0),
+            "expected raw log-odds margins outside [0, 1] probability range"
+        );
+
+        // 3. Confirm bit-identical predictions and serialized artifacts across two trainings.
+        let probs1 = res1.model.predict_probs(&probe_rows);
+        let probs2 = res2.model.predict_probs(&probe_rows);
+        assert_eq!(probs1.len(), probs2.len());
+        for (i, (&p1, &p2)) in probs1.iter().zip(probs2.iter()).enumerate() {
+            assert_eq!(
+                p1.to_bits(),
+                p2.to_bits(),
+                "prediction mismatch at row {i}: {p1} vs {p2}"
+            );
+            assert!(p1 > 0.0 && p1 < 1.0);
+        }
+
+        let json1 = res1.model.to_json().expect("serialize artifact 1");
+        let json2 = res2.model.to_json().expect("serialize artifact 2");
+        assert_eq!(json1, json2, "serialized ModelArtifact must be bit-identical");
+
+        // 4. Confirm deserialized model reproduces bit-identical predictions.
+        let reloaded = TrainedModel::from_json(&json1).expect("deserialize artifact");
+        let probs_reloaded = reloaded.predict_probs(&probe_rows);
+        for (&p1, &pr) in probs1.iter().zip(probs_reloaded.iter()) {
+            assert_eq!(p1.to_bits(), pr.to_bits());
+        }
+    }
+
+    #[test]
+    fn platt_calibrator_improves_brier_and_handles_degenerate_splits() {
+        // 1. Construct uncalibrated, overconfident, shifted synthetic logits:
+        //    true p = sigmoid(x), but raw model outputs z = 3.0 * x + 2.0.
+        let mut raw_logits = Vec::new();
+        let mut labels = Vec::new();
+        for i in 0..200 {
+            let x = -3.0 + 6.0 * (i as f64) / 199.0;
+            let true_p = sigmoid(x);
+            // Deterministic stratified pseudo-sampling matching true_p.
+            let threshold = ((i * 37 + 13) % 100) as f64 / 100.0;
+            let y = threshold < true_p;
+            raw_logits.push(3.0 * x + 2.0);
+            labels.push(y);
+        }
+
+        let raw_probs: Vec<f64> = raw_logits.iter().map(|&z| sigmoid(z)).collect();
+        let raw_brier = brier_score(&raw_probs, &labels);
+
+        let cal = PlattCalibrator::fit(&raw_logits, &labels, 0.5);
+        assert!(cal.a.is_finite() && cal.b.is_finite());
+        assert!(cal.a >= 0.0, "Platt slope a must be non-negative, got {}", cal.a);
+
+        let cal_probs: Vec<f64> = raw_logits.iter().map(|&z| cal.predict_prob(z)).collect();
+        let cal_brier = brier_score(&cal_probs, &labels);
+        assert!(
+            cal_brier < raw_brier,
+            "Platt calibration must lower Brier score: cal={cal_brier:.6} vs raw={raw_brier:.6}"
+        );
+
+        // 2. Inverted logits (where unconstrained slope would be negative) must clamp/fallback to a >= 0.
+        let inverted_logits: Vec<f64> = vec![-3.0, -2.5, -2.0, -1.5, 1.5, 2.0, 2.5, 3.0];
+        let inverted_labels: Vec<bool> = vec![true, true, true, true, false, false, false, false];
+        let inv_cal = PlattCalibrator::fit(&inverted_logits, &inverted_labels, 0.25);
+        assert!(inv_cal.a >= 0.0 && inv_cal.a.is_finite() && inv_cal.b.is_finite());
+        assert!((inv_cal.a - 1.0).abs() < 1e-12);
+        assert!((inv_cal.b - logit(0.25)).abs() < 1e-12);
+
+        // 3. Degenerate 0-positive and 0-negative calibration splits must fall back deterministically without NaN.
+        let zero_pos = PlattCalibrator::fit(&[-1.0, 0.0, 1.0, 2.0], &[false, false, false, false], 0.15);
+        assert!((zero_pos.a - 1.0).abs() < 1e-12);
+        assert!((zero_pos.b - logit(0.15)).abs() < 1e-12);
+        assert!(zero_pos.predict_prob(0.5).is_finite());
+
+        let zero_neg = PlattCalibrator::fit(&[-1.0, 0.0, 1.0], &[true, true, true], 0.0);
+        assert!((zero_neg.a - 1.0).abs() < 1e-12);
+        assert!((zero_neg.b - logit(1e-4)).abs() < 1e-12);
+        assert!(zero_neg.predict_prob(0.5).is_finite());
+    }
+
+    #[test]
+    fn chronological_split_has_zero_leakage_across_runs() {
+        use std::collections::HashSet;
+
+        use pts_core::{CommitRecord, DiffFile, RunMode, TestStatus};
+        use pts_store::{RunRecord, Store, TestOutcomeRecord};
+
+        // 1. Verify strict chronological 80/20 split with zero run overlap and skip exclusion.
+        let runs = make_synthetic_runs(25);
+        let split = build_chronological_split(&runs, &[]).expect("build chronological split");
+
+        assert!(
+            split.max_train_ts < split.min_cal_ts,
+            "strict anti-leakage violated: max_train_ts={} >= min_cal_ts={}",
+            split.max_train_ts,
+            split.min_cal_ts
+        );
+
+        let train_run_ids: HashSet<&str> = split.train_rows.iter().map(|r| r.run_id.as_str()).collect();
+        let cal_run_ids: HashSet<&str> = split.cal_rows.iter().map(|r| r.run_id.as_str()).collect();
+        assert!(
+            train_run_ids.is_disjoint(&cal_run_ids),
+            "no run_id may appear in both train and calibration splits"
+        );
+        assert!(split.train_rows.iter().all(|r| r.started_at <= split.max_train_ts));
+        assert!(split.cal_rows.iter().all(|r| r.started_at >= split.min_cal_ts));
+        assert_eq!(train_run_ids.len() + cal_run_ids.len(), runs.len());
+
+        // Verify skipped outcomes were excluded.
+        let expected_non_skip: usize = runs
+            .iter()
+            .flat_map(|r| r.outcomes.iter())
+            .filter(|o| o.status != TestStatus::Skip)
+            .count();
+        assert_eq!(split.train_rows.len() + split.cal_rows.len(), expected_non_skip);
+
+        // 2. Verify HistoryAccumulator matches Store::load_history_snapshot at an intermediate cutoff.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("store.db");
+        let mut store = Store::open(&db_path).expect("open store");
+        store.migrate().expect("migrate");
+
+        let commits = vec![
+            // Older than 30 days relative to cutoff_ts (should be in cochange, NOT in 30d churn).
+            CommitRecord {
+                commit_sha: "c_old".to_string(),
+                parent_sha: None,
+                author_hash: "a1".to_string(),
+                commit_ts: 1_690_000_000,
+                files_changed: 2,
+                lines_added: 10,
+                lines_deleted: 2,
+                files: vec![
+                    DiffFile {
+                        path: "src/mod_0.py".to_string(),
+                        lines_added: 6,
+                        lines_deleted: 1,
+                    },
+                    DiffFile {
+                        path: "tests/test_mod_0.py".to_string(),
+                        lines_added: 4,
+                        lines_deleted: 1,
+                    },
+                ],
+            },
+            // Within 30 days before cutoff_ts.
+            CommitRecord {
+                commit_sha: "c_recent".to_string(),
+                parent_sha: Some("c_old".to_string()),
+                author_hash: "a1".to_string(),
+                commit_ts: 1_700_005_000,
+                files_changed: 2,
+                lines_added: 8,
+                lines_deleted: 0,
+                files: vec![
+                    DiffFile {
+                        path: "src/mod_0.py".to_string(),
+                        lines_added: 5,
+                        lines_deleted: 0,
+                    },
+                    DiffFile {
+                        path: "src/mod_1.py".to_string(),
+                        lines_added: 3,
+                        lines_deleted: 0,
+                    },
+                ],
+            },
+            // Strictly after cutoff_ts (must be excluded by both Store and HistoryAccumulator).
+            CommitRecord {
+                commit_sha: "c_future".to_string(),
+                parent_sha: Some("c_recent".to_string()),
+                author_hash: "a2".to_string(),
+                commit_ts: 1_700_050_000,
+                files_changed: 1,
+                lines_added: 50,
+                lines_deleted: 0,
+                files: vec![DiffFile {
+                    path: "src/mod_2.py".to_string(),
+                    lines_added: 50,
+                    lines_deleted: 0,
+                }],
+            },
+        ];
+        store.upsert_commits(&commits).expect("upsert commits");
+
+        for run in &runs {
+            let run_rec = RunRecord {
+                run_id: run.run_id.clone(),
+                commit_sha: run.commit_sha.clone(),
+                diff_fingerprint: run.diff_fingerprint.clone(),
+                runner: "pytest".to_string(),
+                mode: RunMode::All,
+                budget_ms: None,
+                started_at: run.started_at,
+                finished_at: Some(run.started_at + 10),
+                total_duration_ms: Some(1000),
+                exit_code: Some(0),
+            };
+            let tests: Vec<TestCase> = run
+                .outcomes
+                .iter()
+                .map(|o| TestCase {
+                    test_id: o.test_id.clone(),
+                    file_path: o.file_path.clone(),
+                })
+                .collect();
+            let outcomes: Vec<TestOutcomeRecord> = run
+                .outcomes
+                .iter()
+                .map(|o| TestOutcomeRecord {
+                    run_id: run.run_id.clone(),
+                    test_id: o.test_id.clone(),
+                    status: o.status,
+                    duration_ms: o.duration_ms,
+                    predicted_prob: None,
+                    selection_reason: SelectionReason::Full,
+                    sampling_propensity: o.sampling_propensity,
+                    failure_excerpt: None,
+                })
+                .collect();
+            store
+                .persist_run_with_outcomes(&run_rec, &run.diff_files, &tests, &outcomes, run.started_at)
+                .expect("persist run");
+        }
+
+        // Intermediate cutoff: strictly at run[10].started_at -> includes runs 0..10, excludes 10..25.
+        let cutoff_ts = runs[10].started_at;
+        let store_snap = store
+            .load_history_snapshot(cutoff_ts)
+            .expect("load_history_snapshot");
+
+        let mut acc = HistoryAccumulator::new(commits);
+        for run in &runs[..10] {
+            acc.record_run(run);
+        }
+        let acc_snap = acc.snapshot(cutoff_ts);
+
+        assert_eq!(acc_snap.as_of_ts, store_snap.as_of_ts);
+        assert_eq!(acc_snap.total_runs, store_snap.total_runs);
+        assert_eq!(acc_snap.total_failures, store_snap.total_failures);
+        assert_eq!(acc_snap.median_repo_test_ms, store_snap.median_repo_test_ms);
+        assert_eq!(acc_snap.cofail_counts, store_snap.cofail_counts);
+        assert_eq!(acc_snap.file_commit_counts, store_snap.file_commit_counts);
+        assert_eq!(acc_snap.pair_commit_counts, store_snap.pair_commit_counts);
+        assert_eq!(acc_snap.file_churn_30d, store_snap.file_churn_30d);
+        assert_eq!(acc_snap.test_history.len(), store_snap.test_history.len());
+        for (tid, expected) in &store_snap.test_history {
+            let actual = acc_snap.test_history.get(tid).expect("matching test_id");
+            assert_eq!(actual.total_runs, expected.total_runs);
+            assert_eq!(actual.total_failures, expected.total_failures);
+            assert!((actual.ewma_fail_10 - expected.ewma_fail_10).abs() < 1e-12);
+            assert!((actual.ewma_fail_50 - expected.ewma_fail_50).abs() < 1e-12);
+            assert_eq!(actual.runs_since_last_fail, expected.runs_since_last_fail);
+            assert_eq!(actual.median_duration_ms, expected.median_duration_ms);
+            assert!((actual.flakiness_rate - expected.flakiness_rate).abs() < 1e-12);
+            assert_eq!(actual.last_run_ts, expected.last_run_ts);
+        }
     }
 }

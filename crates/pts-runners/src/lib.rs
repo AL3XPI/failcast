@@ -156,4 +156,83 @@ pub mod tests {
         );
         assert_eq!(single_res.outcomes[0].status, TestStatus::Pass);
     }
+
+    #[test]
+    fn junit_parses_class_and_parametrized_node_ids() {
+        // 1. Pure JUnit XML coverage across legacy (`file` attr), xunit2 (no `file` attr),
+        //    stripped module prefix, nested classes, Windows paths, and parametrized tests.
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<testsuites>
+  <testsuite name="pytest" tests="7">
+    <testcase classname="tests.test_a.TestAuth" name="test_login" file="tests/test_a.py" time="0.010" />
+    <testcase classname="test_a.TestAuth" name="test_logout" file="./tests/test_a.py" time="0.015" />
+    <testcase classname="tests.test_a.TestAuth.TestOAuth" name="test_refresh[admin-v2]" file="tests\test_a.py" time="0.020" />
+    <testcase classname="tests.test_a" name="test_calc[1-2]" file="tests/test_a.py" time="0.005" />
+    <testcase classname="tests.test_a.TestAuth" name="test_xunit2_class" time="0.008" />
+    <testcase classname="tests.test_a" name="test_xunit2_param[a.b-c]" time="0.004" />
+    <testcase classname="tests.test_a.TestAuth()" name="test_parens_stripped" file="tests/test_a.py" time="0.003" />
+  </testsuite>
+</testsuites>"#;
+
+        let outcomes = parse_junit_xml(xml, 1500).expect("parse junit xml");
+        let parsed_ids: Vec<&str> = outcomes.iter().map(|o| o.test_id.as_str()).collect();
+        assert_eq!(
+            parsed_ids,
+            vec![
+                "tests/test_a.py::TestAuth::test_login",
+                "tests/test_a.py::TestAuth::test_logout",
+                "tests/test_a.py::TestAuth::TestOAuth::test_refresh[admin-v2]",
+                "tests/test_a.py::test_calc[1-2]",
+                "tests/test_a.py::TestAuth::test_xunit2_class",
+                "tests/test_a.py::test_xunit2_param[a.b-c]",
+                "tests/test_a.py::TestAuth::test_parens_stripped",
+            ]
+        );
+
+        // 2. End-to-end parity check against real `pytest --collect-only` and `pytest --junitxml`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("tests")).expect("mkdir tests");
+        std::fs::write(
+            dir.path().join("tests/test_a.py"),
+            r#"import pytest
+
+
+class TestAuth:
+    def test_login(self):
+        assert True
+
+    @pytest.mark.parametrize("role,tier", [("admin", 1), ("guest", 2)])
+    def test_role_access(self, role, tier):
+        assert role and tier > 0
+
+
+@pytest.mark.parametrize("a,b", [(1, 2), (3, 4)])
+def test_calc(a, b):
+    assert a + b > 0
+"#,
+        )
+        .expect("write tests/test_a.py");
+
+        let runner = PytestRunner::default();
+        let discovered = runner.discover(dir.path()).expect("discover pytest tests");
+        let discovered_ids: Vec<String> = discovered.into_iter().map(|t| t.test_id).collect();
+        assert_eq!(
+            discovered_ids,
+            vec![
+                "tests/test_a.py::TestAuth::test_login",
+                "tests/test_a.py::TestAuth::test_role_access[admin-1]",
+                "tests/test_a.py::TestAuth::test_role_access[guest-2]",
+                "tests/test_a.py::test_calc[1-2]",
+                "tests/test_a.py::test_calc[3-4]",
+            ]
+        );
+
+        let executed = runner.execute(dir.path(), None).expect("execute pytest");
+        assert_eq!(executed.exit_code, 0);
+        let executed_ids: Vec<String> = executed.outcomes.into_iter().map(|o| o.test_id).collect();
+        assert_eq!(
+            executed_ids, discovered_ids,
+            "JUnit parsed node IDs must match pytest --collect-only exactly"
+        );
+    }
 }

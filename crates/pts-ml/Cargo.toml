@@ -4,8 +4,11 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+forust-ml = { workspace = true }
 pts-core = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
-serde_json = { workspace = true }
+pts-store = { workspace = true }
+tempfile = { workspace = true }

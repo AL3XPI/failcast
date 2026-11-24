@@ -1,6 +1,6 @@
 pub mod store;
 
-pub use store::{RunRecord, Store, TestOutcomeRecord, TestRecord};
+pub use store::{ModelRecord, RunRecord, Store, TestOutcomeRecord, TestRecord};
 
 #[cfg(test)]
 pub mod tests {

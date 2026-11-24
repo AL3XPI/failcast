@@ -299,18 +299,83 @@ pub fn truncate_chars(s: &str, max_chars: usize) -> String {
     s.chars().take(max_chars).collect()
 }
 
-/// Normalizes a repo-relative path to POSIX separators without leading `./`.
+/// Normalizes a repo-relative path to POSIX separators without leading `./` or `/`.
 pub fn normalize_posix_path(path: &str) -> String {
-    let replaced = path.replace('\\', "/");
-    replaced
-        .strip_prefix("./")
-        .unwrap_or(&replaced)
-        .to_string()
+    pts_core::normalize_posix_path(path)
+}
+
+/// Extracts class path segments from a JUnit `classname` given a file's dotted `module_prefix`.
+fn extract_class_suffix(module_prefix: &str, classname: &str) -> String {
+    let trimmed = classname.trim();
+    if trimmed.is_empty() || trimmed == module_prefix {
+        return String::new();
+    }
+
+    // 1. Exact dotted module prefix match (e.g. `tests.test_a.TestAuth` with `tests.test_a`).
+    if let Some(rest) = trimmed.strip_prefix(module_prefix) {
+        if rest.is_empty() {
+            return String::new();
+        }
+        if let Some(after_dot) = rest.strip_prefix('.') {
+            return after_dot.to_string();
+        }
+    }
+
+    // 2. Module prefix preceded by an outer package root (e.g. `repo.tests.test_a.TestAuth`).
+    let dotted_mid = format!(".{module_prefix}.");
+    if let Some(idx) = trimmed.find(&dotted_mid) {
+        return trimmed[idx + dotted_mid.len()..].to_string();
+    }
+    let dotted_end = format!(".{module_prefix}");
+    if trimmed.ends_with(&dotted_end) {
+        return String::new();
+    }
+
+    // 3. Suffix of module prefix when pytest strips outer test directories
+    //    (e.g. file="tests/unit/test_a.py", classname="test_a.TestAuth").
+    let mod_parts: Vec<&str> = module_prefix.split('.').collect();
+    for start in 1..mod_parts.len() {
+        let suffix = mod_parts[start..].join(".");
+        if trimmed == suffix {
+            return String::new();
+        }
+        if let Some(rest) = trimmed.strip_prefix(&suffix)
+            && let Some(after_dot) = rest.strip_prefix('.')
+        {
+            return after_dot.to_string();
+        }
+    }
+
+    // 4. Bare class path without module prefix (e.g. classname="TestAuth" or "TestAuth.TestSub").
+    if !trimmed.contains('/')
+        && !trimmed.ends_with(".py")
+        && trimmed
+            .split('.')
+            .next()
+            .is_some_and(|seg| seg.starts_with(|c: char| c.is_ascii_uppercase()))
+    {
+        return trimmed.to_string();
+    }
+
+    String::new()
+}
+
+fn format_class_path(raw_class_suffix: &str) -> String {
+    raw_class_suffix
+        .split('.')
+        .map(str::trim)
+        .map(|seg| seg.strip_suffix("()").unwrap_or(seg))
+        .filter(|seg| !seg.is_empty())
+        .collect::<Vec<_>>()
+        .join("::")
 }
 
 /// Converts JUnit `(file, classname, name)` attributes into a canonical pytest node ID,
-/// e.g. `tests/test_calc.py::test_add_positive` or `tests/test_calc.py::TestMath::test_add`.
+/// e.g. `tests/test_calc.py::test_add_positive`, `tests/test_a.py::TestAuth::test_login`,
+/// or `tests/test_a.py::test_calc[1-2]`.
 pub fn canonical_test_id(file: Option<&str>, classname: &str, name: &str) -> String {
+    let trimmed_name = name.trim();
+
     if let Some(raw_file) = file
         && !raw_file.trim().is_empty()
     {
@@ -323,27 +388,23 @@ pub fn canonical_test_id(file: Option<&str>, classname: &str, name: &str) -> Str
             .strip_suffix(".__init__")
             .unwrap_or(&module_prefix);
 
-        let class_suffix = if let Some(rest) = classname.strip_prefix(module_prefix) {
-            rest.strip_prefix('.').unwrap_or("")
-        } else {
-            ""
-        };
+        let raw_class_suffix = extract_class_suffix(module_prefix, classname);
+        let class_path = format_class_path(&raw_class_suffix);
 
-        if class_suffix.is_empty() {
-            return format!("{posix_file}::{name}");
+        if class_path.is_empty() {
+            return format!("{posix_file}::{trimmed_name}");
         }
-        let class_path = class_suffix.replace('.', "::");
-        return format!("{posix_file}::{class_path}::{name}");
+        return format!("{posix_file}::{class_path}::{trimmed_name}");
     }
 
     let trimmed = classname.trim();
     if trimmed.is_empty() {
-        return name.to_string();
+        return trimmed_name.to_string();
     }
 
     if trimmed.contains('/') || trimmed.ends_with(".py") {
         let posix_file = normalize_posix_path(trimmed);
-        return format!("{posix_file}::{name}");
+        return format!("{posix_file}::{trimmed_name}");
     }
 
     let parts: Vec<&str> = trimmed.split('.').collect();
@@ -359,12 +420,16 @@ pub fn canonical_test_id(file: Option<&str>, classname: &str, name: &str) -> Str
     match class_idx {
         Some(idx) => {
             let file_path = format!("{}.py", parts[..idx].join("/"));
-            let class_path = parts[idx..].join("::");
-            format!("{file_path}::{class_path}::{name}")
+            let class_path = parts[idx..]
+                .iter()
+                .map(|seg| seg.strip_suffix("()").unwrap_or(seg))
+                .collect::<Vec<_>>()
+                .join("::");
+            format!("{file_path}::{class_path}::{trimmed_name}")
         }
         None => {
             let file_path = format!("{}.py", parts.join("/"));
-            format!("{file_path}::{name}")
+            format!("{file_path}::{trimmed_name}")
         }
     }
 }

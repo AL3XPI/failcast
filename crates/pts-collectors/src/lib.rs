@@ -4,7 +4,10 @@ pub mod ast_python;
 pub mod git;
 
 pub use ast_python::{ImportGraph, ImportGraphBuilder, PythonImportGraphBuilder};
-pub use git::{extract_working_diff, hash_author, is_git_repo, mine_commit_history};
+pub use git::{
+    TempGitWorktree, extract_working_diff, hash_author, is_git_repo, mine_commit_history,
+    mine_commit_history_from_ref,
+};
 
 #[cfg(test)]
 pub mod tests {

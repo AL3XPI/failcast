@@ -303,3 +303,27 @@ impl HistorySnapshot {
         self.file_churn_30d.get(file_path).copied().unwrap_or(0)
     }
 }
+
+/// A single persisted test outcome within a historical run, used for pure ML
+/// feature accumulation and walk-forward evaluation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HistoricalOutcome {
+    pub test_id: String,
+    pub file_path: String,
+    pub status: TestStatus,
+    pub duration_ms: u64,
+    pub sampling_propensity: f64,
+    /// Optional precomputed directed AST hop distance from `file_path` to any modified file.
+    pub ast_min_hop: Option<usize>,
+}
+
+/// A persisted test run with its diff files and test outcomes, ordered chronologically.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HistoricalRun {
+    pub run_id: String,
+    pub commit_sha: Option<String>,
+    pub diff_fingerprint: String,
+    pub started_at: i64,
+    pub diff_files: Vec<DiffFile>,
+    pub outcomes: Vec<HistoricalOutcome>,
+}

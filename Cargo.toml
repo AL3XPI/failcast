@@ -19,6 +19,7 @@ license = "MIT"
 anyhow = "1"
 assert_cmd = "2"
 clap = { version = "4", features = ["derive"] }
+forust-ml = "0.8"
 predicates = "3"
 quick-xml = "0.37"
 rusqlite = { version = "0.34", features = ["bundled"] }

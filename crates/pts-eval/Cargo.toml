@@ -5,3 +5,6 @@ edition.workspace = true
 
 [dependencies]
 pts-core = { workspace = true }
+pts-ml = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

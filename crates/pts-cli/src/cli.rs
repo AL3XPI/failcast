@@ -5,18 +5,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use pts_collectors::{
-    ImportGraphBuilder, PythonImportGraphBuilder, extract_working_diff, is_git_repo,
-    mine_commit_history,
+    ImportGraph, ImportGraphBuilder, PythonImportGraphBuilder, TempGitWorktree,
+    extract_working_diff, is_git_repo, mine_commit_history, mine_commit_history_from_ref,
 };
 use pts_core::{
-    Config, DiffSummary, HistorySnapshot, PtsError, RunMode, RunnerResult, SelectionReason,
-    TestCase, TestRunner, TestStatus,
+    Config, DiffSummary, HistoricalRun, HistorySnapshot, PtsError, RunMode, RunnerResult,
+    SelectionReason, TestCase, TestRunner, TestStatus,
 };
+use pts_eval::{WalkForwardConfig, walk_forward_eval};
 use pts_ml::{
-    CandidateTest, SelectedTest, SelectionStrategy, extract_features, score_heuristic, select_tests,
+    CandidateTest, NUM_FEATURES, SelectedTest, SelectionStrategy, TrainedModel, extract_features,
+    score_heuristic, select_tests, should_use_heuristic, train_gbdt_model,
 };
 use pts_runners::{PytestRunner, normalize_posix_path};
-use pts_store::{RunRecord, Store, TestOutcomeRecord};
+use pts_store::{ModelRecord, RunRecord, Store, TestOutcomeRecord};
 use serde::Serialize;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -24,6 +26,7 @@ use uuid::Uuid;
 use crate::mcp;
 
 const DEFAULT_UNSEEN_STALENESS_DAYS: f64 = 30.0;
+const MODEL_ARTIFACT_REL_PATH: &str = ".pts/model.json";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -42,15 +45,14 @@ pub enum Command {
     Init(InitArgs),
     /// Select and execute tests, persisting outcomes to .pts/store.db.
     Run(RunArgs),
-    /// Train the GBDT + Platt calibration model (Milestone 3).
+    /// Train the GBDT + Platt calibration model from .pts/store.db.
     Train,
     /// Explain the ranking features and score for a specific test (Milestone 4).
     Explain { test_id: String },
-    /// Run chronological walk-forward evaluation against baselines (Milestone 3).
-    Eval {
-        #[arg(long)]
-        output_json: PathBuf,
-    },
+    /// Run chronological walk-forward evaluation against baselines.
+    Eval(EvalArgs),
+    /// Replay historical git commits in an isolated worktree to populate .pts/store.db.
+    Backfill(BackfillArgs),
     /// Start the local MCP server over stdio (Milestone 4).
     Mcp,
 }
@@ -92,6 +94,36 @@ pub struct RunArgs {
     /// Emit machine-readable JSON output to stdout.
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct EvalArgs {
+    /// Optional path to write structured JSON evaluation report.
+    #[arg(long)]
+    pub output_json: Option<PathBuf>,
+
+    /// Comma-separated budget fractions of full-suite duration (e.g. 0.1,0.2,0.3).
+    #[arg(long, default_value = "0.1,0.2,0.3")]
+    pub budgets: String,
+
+    /// Minimum number of warmup runs prior to walk-forward evaluation.
+    #[arg(long, default_value_t = 20)]
+    pub min_train_runs: usize,
+
+    /// Retrain cadence (number of evaluated runs between GBDT retrains).
+    #[arg(long, default_value_t = 5)]
+    pub retrain_every: usize,
+}
+
+#[derive(Debug, Args)]
+pub struct BackfillArgs {
+    /// Number of historical commits to replay into .pts/store.db.
+    #[arg(long, value_name = "N")]
+    pub commits: usize,
+
+    /// Starting git ref to walk backwards from (defaults to HEAD).
+    #[arg(long, default_value = "HEAD")]
+    pub r#ref: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -145,9 +177,19 @@ pub fn execute(cli: Cli, repo_root: &Path) -> Result<i32> {
             Ok(0)
         }
         Command::Run(args) => cmd_run(repo_root, args),
-        Command::Train => bail!("`pts train` is planned for Milestone 3"),
+        Command::Train => {
+            cmd_train(repo_root)?;
+            Ok(0)
+        }
         Command::Explain { .. } => bail!("`pts explain` is planned for Milestone 4"),
-        Command::Eval { .. } => bail!("`pts eval` is planned for Milestone 3"),
+        Command::Eval(args) => {
+            cmd_eval(repo_root, args)?;
+            Ok(0)
+        }
+        Command::Backfill(args) => {
+            cmd_backfill(repo_root, args)?;
+            Ok(0)
+        }
         Command::Mcp => {
             mcp::run_mcp()?;
             Ok(0)
@@ -209,6 +251,275 @@ fn check_gitignore_warning(repo_root: &Path) {
     }
 }
 
+fn cmd_train(repo_root: &Path) -> Result<()> {
+    let db_path = repo_root.join(".pts").join("store.db");
+    if !db_path.is_file() {
+        return Err(PtsError::NotInitialized.into());
+    }
+
+    let store = Store::open(&db_path)?;
+    store.migrate()?;
+
+    let mut runs = store.load_historical_runs()?;
+    let commits = store.load_commits()?;
+    if runs.is_empty() {
+        bail!("no historical test runs found in {}; run `pts run --all` or `pts backfill` first", db_path.display());
+    }
+
+    let graph = PythonImportGraphBuilder::new().build(repo_root)?;
+    populate_ast_hops(&mut runs, &graph);
+
+    let trained_at = current_unix_ts();
+    let result = train_gbdt_model(&runs, &commits, trained_at)
+        .context("failed to train GBDT + Platt model")?;
+
+    let model_path = repo_root.join(MODEL_ARTIFACT_REL_PATH);
+    if let Some(parent) = model_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let artifact_json = result.model.to_json()?;
+    std::fs::write(&model_path, &artifact_json)
+        .with_context(|| format!("failed to write model artifact to {}", model_path.display()))?;
+
+    let model_id = Uuid::new_v4().to_string();
+    let artifact = &result.model.artifact;
+    let model_record = ModelRecord {
+        model_id: model_id.clone(),
+        trained_at: artifact.trained_at,
+        max_train_ts: artifact.max_train_ts,
+        train_rows: artifact.train_rows,
+        pos_rows: artifact.pos_rows,
+        brier_score: artifact.brier_score,
+        calibration_a: artifact.platt_a,
+        calibration_b: artifact.platt_b,
+        artifact_path: MODEL_ARTIFACT_REL_PATH.to_string(),
+    };
+    store.insert_model(&model_record)?;
+
+    info!(
+        model_id = %model_id,
+        train_rows = artifact.train_rows,
+        cal_rows = result.cal_rows,
+        brier_score = artifact.brier_score,
+        "trained GBDT + Platt model"
+    );
+
+    println!("Trained PTS model ({model_id}) -> {}", model_path.display());
+    println!(
+        "  Train: {} rows ({} positives across {} run(s))",
+        artifact.train_rows, artifact.pos_rows, result.train_run_count
+    );
+    println!(
+        "  Cal:   {} rows ({} positives across {} run(s))",
+        result.cal_rows, result.cal_pos_rows, result.cal_run_count
+    );
+    println!(
+        "  Brier: {:.6} (uncalibrated: {:.6})",
+        result.calibrated_brier, result.uncalibrated_brier
+    );
+    println!(
+        "  Platt: a={:.6}, b={:.6}",
+        artifact.platt_a, artifact.platt_b
+    );
+
+    Ok(())
+}
+
+fn cmd_eval(repo_root: &Path, args: EvalArgs) -> Result<()> {
+    let db_path = repo_root.join(".pts").join("store.db");
+    if !db_path.is_file() {
+        return Err(PtsError::NotInitialized.into());
+    }
+
+    let budget_fractions = parse_budgets(&args.budgets)?;
+    let config = Config::load(repo_root)?;
+
+    let store = Store::open(&db_path)?;
+    store.migrate()?;
+
+    let mut runs = store.load_historical_runs()?;
+    let commits = store.load_commits()?;
+    let graph = PythonImportGraphBuilder::new().build(repo_root)?;
+    populate_ast_hops(&mut runs, &graph);
+
+    let wf_config = WalkForwardConfig {
+        min_train_runs: args.min_train_runs,
+        retrain_every: args.retrain_every,
+        budget_fractions,
+        selector_config: config,
+    };
+
+    let report = walk_forward_eval(&runs, &commits, &wf_config)
+        .context("walk-forward evaluation failed")?;
+
+    print!("{}", report.render_markdown());
+
+    if let Some(output_path) = args.output_json {
+        let resolved = if output_path.is_absolute() {
+            output_path
+        } else {
+            repo_root.join(output_path)
+        };
+        if let Some(parent) = resolved.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let json = report.to_json_pretty()?;
+        std::fs::write(&resolved, json)
+            .with_context(|| format!("failed to write JSON report to {}", resolved.display()))?;
+        info!(path = %resolved.display(), "wrote walk-forward evaluation JSON report");
+    }
+
+    Ok(())
+}
+
+fn cmd_backfill(repo_root: &Path, args: BackfillArgs) -> Result<()> {
+    if args.commits == 0 {
+        bail!("--commits must be at least 1");
+    }
+
+    let db_path = repo_root.join(".pts").join("store.db");
+    if !db_path.is_file() {
+        return Err(PtsError::NotInitialized.into());
+    }
+    if !is_git_repo(repo_root) {
+        bail!("`pts backfill` requires a git repository");
+    }
+
+    let config = Config::load(repo_root)?;
+    let runner = PytestRunner::from_config(&config);
+    let mut store = Store::open(&db_path)?;
+    store.migrate()?;
+
+    let mut commits = mine_commit_history_from_ref(repo_root, &args.r#ref, args.commits)?;
+    if commits.is_empty() {
+        println!("No commits found for ref `{}`", args.r#ref);
+        return Ok(());
+    }
+
+    store.upsert_commits(&commits)?;
+    // Process oldest-to-newest so history replays chronologically.
+    commits.reverse();
+
+    let worktree = TempGitWorktree::create(repo_root, &commits[0].commit_sha)
+        .context("failed to create temporary git worktree for backfill")?;
+
+    let mut persisted = 0usize;
+    let mut skipped = 0usize;
+
+    for (idx, commit) in commits.iter().enumerate() {
+        if idx > 0
+            && let Err(err) = worktree.checkout(&commit.commit_sha)
+        {
+            warn!(
+                commit = %commit.commit_sha,
+                error = %err,
+                "backfill skipping commit: checkout failed"
+            );
+            skipped += 1;
+            continue;
+        }
+
+        let discovered = match runner.discover(worktree.path()) {
+            Ok(cases) => cases,
+            Err(err) => {
+                warn!(
+                    commit = %commit.commit_sha,
+                    error = %err,
+                    "backfill skipping commit: pytest discovery failed"
+                );
+                skipped += 1;
+                continue;
+            }
+        };
+
+        let result = match runner.execute(worktree.path(), None) {
+            Ok(res) => res,
+            Err(err) => {
+                warn!(
+                    commit = %commit.commit_sha,
+                    error = %err,
+                    "backfill skipping commit: pytest execution failed"
+                );
+                skipped += 1;
+                continue;
+            }
+        };
+
+        let diff = DiffSummary::from_files(Some(commit.commit_sha.clone()), commit.files.clone());
+        let run_id = Uuid::new_v4().to_string();
+        let started_at = commit.commit_ts;
+        let finished_at = started_at.saturating_add((result.total_duration_ms / 1000) as i64);
+
+        let mut tests_to_upsert = discovered;
+        let mut known_ids: HashSet<String> = tests_to_upsert
+            .iter()
+            .map(|t| t.test_id.clone())
+            .collect();
+        for outcome in &result.outcomes {
+            if known_ids.insert(outcome.test_id.clone()) {
+                let file_path = outcome
+                    .test_id
+                    .split("::")
+                    .next()
+                    .map(normalize_posix_path)
+                    .unwrap_or_else(|| outcome.test_id.clone());
+                tests_to_upsert.push(TestCase {
+                    test_id: outcome.test_id.clone(),
+                    file_path,
+                });
+            }
+        }
+
+        let run_record = RunRecord {
+            run_id: run_id.clone(),
+            commit_sha: Some(commit.commit_sha.clone()),
+            diff_fingerprint: diff.diff_fingerprint,
+            runner: runner.name().to_string(),
+            mode: RunMode::Backfill,
+            budget_ms: None,
+            started_at,
+            finished_at: Some(finished_at),
+            total_duration_ms: Some(result.total_duration_ms as i64),
+            exit_code: Some(result.exit_code),
+        };
+
+        let outcome_records: Vec<TestOutcomeRecord> = result
+            .outcomes
+            .iter()
+            .map(|o| TestOutcomeRecord {
+                run_id: run_id.clone(),
+                test_id: o.test_id.clone(),
+                status: o.status,
+                duration_ms: o.duration_ms,
+                predicted_prob: None,
+                selection_reason: SelectionReason::Full,
+                sampling_propensity: 1.0,
+                failure_excerpt: o.failure_message.clone(),
+            })
+            .collect();
+
+        store.persist_run_with_outcomes(
+            &run_record,
+            &diff.files,
+            &tests_to_upsert,
+            &outcome_records,
+            started_at,
+        )?;
+        persisted += 1;
+    }
+
+    drop(worktree);
+
+    println!(
+        "Backfilled {persisted}/{} commit(s) from `{}` ({skipped} skipped)",
+        commits.len(),
+        args.r#ref
+    );
+    Ok(())
+}
+
 fn cmd_run(repo_root: &Path, args: RunArgs) -> Result<i32> {
     if let Some(recall) = args.target_recall
         && (!recall.is_finite() || recall <= 0.0 || recall >= 1.0)
@@ -252,15 +563,40 @@ fn cmd_run(repo_root: &Path, args: RunArgs) -> Result<i32> {
             HistorySnapshot::default()
         };
 
+        let loaded_model = try_load_model(repo_root);
+        let use_gbdt = !should_use_heuristic(&history, &config, loaded_model.is_some());
+
         let graph = PythonImportGraphBuilder::new().build(repo_root)?;
         let modified_paths: Vec<&str> = diff.files.iter().map(|f| f.path.as_str()).collect();
 
-        let candidates: Vec<CandidateTest> = discovered
+        let feature_rows: Vec<[f64; NUM_FEATURES]> = discovered
             .iter()
             .map(|tc| {
                 let ast_min_hop = graph.min_hop_to_any(&tc.file_path, &modified_paths);
-                let features = extract_features(tc, &diff, &history, ast_min_hop);
-                let prob = score_heuristic(&features);
+                extract_features(tc, &diff, &history, ast_min_hop)
+            })
+            .collect();
+
+        let (probs, active_model_mode, primary_reason) = if use_gbdt
+            && let Some(ref model) = loaded_model
+        {
+            (
+                model.predict_probs(&feature_rows),
+                "gbdt",
+                SelectionReason::Ranked,
+            )
+        } else {
+            (
+                feature_rows.iter().map(score_heuristic).collect(),
+                "heuristic",
+                SelectionReason::Heuristic,
+            )
+        };
+
+        let candidates: Vec<CandidateTest> = discovered
+            .iter()
+            .zip(probs)
+            .map(|(tc, prob)| {
                 let test_hist = history.test_history.get(&tc.test_id);
                 let est_duration_ms = test_hist.and_then(|h| h.median_duration_ms);
                 let days_since_last_run = test_hist
@@ -306,9 +642,15 @@ fn cmd_run(repo_root: &Path, args: RunArgs) -> Result<i32> {
             &diff.diff_fingerprint,
             history.median_repo_test_ms,
             &config,
-            SelectionReason::Heuristic,
+            primary_reason,
         );
-        (run_mode, label, "heuristic", budget_ms_opt, Some(selected))
+        (
+            run_mode,
+            label,
+            active_model_mode,
+            budget_ms_opt,
+            Some(selected),
+        )
     };
 
     if args.dry_run {
@@ -423,6 +765,65 @@ fn cmd_run(repo_root: &Path, args: RunArgs) -> Result<i32> {
 
     emit_run_report(&run_id, mode, model_mode, &result, args.json)?;
     Ok(result.exit_code)
+}
+
+fn try_load_model(repo_root: &Path) -> Option<TrainedModel> {
+    let model_path = repo_root.join(MODEL_ARTIFACT_REL_PATH);
+    if !model_path.is_file() {
+        return None;
+    }
+    let raw = match std::fs::read_to_string(&model_path) {
+        Ok(content) => content,
+        Err(err) => {
+            warn!(
+                path = %model_path.display(),
+                error = %err,
+                "failed to read model artifact; falling back to heuristic"
+            );
+            return None;
+        }
+    };
+    match TrainedModel::from_json(&raw) {
+        Ok(model) => Some(model),
+        Err(err) => {
+            warn!(
+                path = %model_path.display(),
+                error = %err,
+                "invalid model artifact; falling back to heuristic"
+            );
+            None
+        }
+    }
+}
+
+fn populate_ast_hops(runs: &mut [HistoricalRun], graph: &ImportGraph) {
+    for run in runs {
+        let modified_paths: Vec<&str> = run.diff_files.iter().map(|f| f.path.as_str()).collect();
+        for outcome in &mut run.outcomes {
+            outcome.ast_min_hop = graph.min_hop_to_any(&outcome.file_path, &modified_paths);
+        }
+    }
+}
+
+fn parse_budgets(raw: &str) -> Result<Vec<f64>> {
+    let mut budgets = Vec::new();
+    for part in raw.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let val: f64 = trimmed
+            .parse()
+            .with_context(|| format!("invalid budget fraction '{trimmed}'"))?;
+        if !val.is_finite() || val <= 0.0 || val > 1.0 {
+            bail!("budget fraction must be in (0.0, 1.0], got {val}");
+        }
+        budgets.push(val);
+    }
+    if budgets.is_empty() {
+        bail!("--budgets must specify at least one budget fraction in (0.0, 1.0]");
+    }
+    Ok(budgets)
 }
 
 fn emit_dry_run_report(
