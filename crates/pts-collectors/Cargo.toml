@@ -5,3 +5,9 @@ edition.workspace = true
 
 [dependencies]
 pts-core = { workspace = true }
+sha2 = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-python = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

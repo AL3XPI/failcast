@@ -30,6 +30,8 @@ thiserror = "2"
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tree-sitter = "0.25"
+tree-sitter-python = "0.23"
 uuid = { version = "1", features = ["v4"] }
 
 pts-core = { path = "crates/pts-core" }

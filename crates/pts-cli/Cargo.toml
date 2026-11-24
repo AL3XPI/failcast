@@ -10,7 +10,9 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
+pts-collectors = { workspace = true }
 pts-core = { workspace = true }
+pts-ml = { workspace = true }
 pts-runners = { workspace = true }
 pts-store = { workspace = true }
 serde = { workspace = true }

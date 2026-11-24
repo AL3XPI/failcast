@@ -1,12 +1,20 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use pts_core::{DiffFile, PtsError, RunMode, SelectionReason, TestCase, TestStatus};
+use pts_core::{
+    CoFailCounts, CommitRecord, DiffFile, HistorySnapshot, PtsError, RunMode, SelectionReason,
+    TestCase, TestHistory, TestStatus,
+};
 use rusqlite::{Connection, OptionalExtension, params};
 
 const SCHEMA_SQL: &str = include_str!("schema.sql");
 const SCHEMA_VERSION: i64 = 1;
+const SECONDS_PER_30_DAYS: i64 = 30 * 86_400;
+const MAX_COCHANGE_FILES_PER_COMMIT: usize = 200;
+const EWMA_ALPHA_10: f64 = 0.2;
+const EWMA_ALPHA_50: f64 = 0.04;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunRecord {
@@ -435,6 +443,370 @@ impl Store {
             files.push(row.map_err(store_err)?);
         }
         Ok(files)
+    }
+
+    /// Idempotently ingests mined git commits and their per-file diff statistics.
+    pub fn upsert_commits(&mut self, commits: &[CommitRecord]) -> Result<usize, PtsError> {
+        let tx = self.conn.transaction().map_err(store_err)?;
+
+        {
+            let mut commit_stmt = tx
+                .prepare(
+                    "
+                    INSERT INTO commits (
+                        commit_sha, parent_sha, author_hash, commit_ts,
+                        files_changed, lines_added, lines_deleted
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    ON CONFLICT(commit_sha) DO UPDATE SET
+                        parent_sha = excluded.parent_sha,
+                        author_hash = excluded.author_hash,
+                        commit_ts = excluded.commit_ts,
+                        files_changed = excluded.files_changed,
+                        lines_added = excluded.lines_added,
+                        lines_deleted = excluded.lines_deleted
+                    ",
+                )
+                .map_err(store_err)?;
+
+            let mut file_stmt = tx
+                .prepare(
+                    "
+                    INSERT INTO commit_files (commit_sha, file_path, lines_added, lines_deleted)
+                    VALUES (?1, ?2, ?3, ?4)
+                    ON CONFLICT(commit_sha, file_path) DO UPDATE SET
+                        lines_added = excluded.lines_added,
+                        lines_deleted = excluded.lines_deleted
+                    ",
+                )
+                .map_err(store_err)?;
+
+            for commit in commits {
+                commit_stmt
+                    .execute(params![
+                        commit.commit_sha,
+                        commit.parent_sha,
+                        commit.author_hash,
+                        commit.commit_ts,
+                        commit.files_changed as i64,
+                        commit.lines_added as i64,
+                        commit.lines_deleted as i64,
+                    ])
+                    .map_err(store_err)?;
+
+                for file in &commit.files {
+                    file_stmt
+                        .execute(params![
+                            commit.commit_sha,
+                            file.path,
+                            file.lines_added as i64,
+                            file.lines_deleted as i64,
+                        ])
+                        .map_err(store_err)?;
+                }
+            }
+        }
+
+        tx.commit().map_err(store_err)?;
+        Ok(commits.len())
+    }
+
+    pub fn commit_count(&self) -> Result<usize, PtsError> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM commits", [], |r| r.get(0))
+            .map_err(store_err)?;
+        Ok(count.max(0) as usize)
+    }
+
+    pub fn run_count(&self) -> Result<usize, PtsError> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM runs", [], |r| r.get(0))
+            .map_err(store_err)?;
+        Ok(count.max(0) as usize)
+    }
+
+    /// Read-only point-in-time history query strictly excluding any run or commit
+    /// with timestamp `>= as_of_ts` (anti-leakage invariant).
+    pub fn load_history_snapshot(&self, as_of_ts: i64) -> Result<HistorySnapshot, PtsError> {
+        let total_runs: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM runs WHERE started_at < ?1",
+                params![as_of_ts],
+                |r| r.get(0),
+            )
+            .map_err(store_err)?;
+
+        let mut snapshot = HistorySnapshot {
+            as_of_ts,
+            total_runs: total_runs.max(0) as usize,
+            ..HistorySnapshot::default()
+        };
+
+        // 1. Chronological per-test outcomes strictly prior to as_of_ts.
+        struct TestAcc {
+            total_runs: u64,
+            total_failures: u64,
+            ewma_10: f64,
+            ewma_50: f64,
+            runs_since_last_fail: Option<u64>,
+            durations: Vec<u64>,
+            last_run_ts: Option<i64>,
+            fp_flags: BTreeMap<String, (bool, bool)>, // (has_pass, has_fail)
+        }
+
+        let mut accs: BTreeMap<String, TestAcc> = BTreeMap::new();
+        let mut repo_durations: Vec<u64> = Vec::new();
+
+        {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "
+                    SELECT o.test_id, o.status, o.duration_ms, r.started_at, r.diff_fingerprint
+                    FROM test_outcomes o
+                    JOIN runs r ON r.run_id = o.run_id
+                    WHERE r.started_at < ?1
+                    ORDER BY r.started_at ASC, r.run_id ASC, o.test_id ASC
+                    ",
+                )
+                .map_err(store_err)?;
+
+            let rows = stmt
+                .query_map(params![as_of_ts], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, String>(4)?,
+                    ))
+                })
+                .map_err(store_err)?;
+
+            for row in rows {
+                let (test_id, status_str, duration_ms, started_at, diff_fp) =
+                    row.map_err(store_err)?;
+                let status = TestStatus::from_str(&status_str)?;
+                let dur = duration_ms.max(0) as u64;
+
+                let entry = accs.entry(test_id).or_insert_with(|| TestAcc {
+                    total_runs: 0,
+                    total_failures: 0,
+                    ewma_10: 0.0,
+                    ewma_50: 0.0,
+                    runs_since_last_fail: None,
+                    durations: Vec::new(),
+                    last_run_ts: None,
+                    fp_flags: BTreeMap::new(),
+                });
+
+                entry.total_runs += 1;
+                entry.last_run_ts = Some(match entry.last_run_ts {
+                    Some(prev) => prev.max(started_at),
+                    None => started_at,
+                });
+
+                match status {
+                    TestStatus::Fail | TestStatus::Error => {
+                        entry.total_failures += 1;
+                        snapshot.total_failures += 1;
+                        entry.ewma_10 = EWMA_ALPHA_10 + (1.0 - EWMA_ALPHA_10) * entry.ewma_10;
+                        entry.ewma_50 = EWMA_ALPHA_50 + (1.0 - EWMA_ALPHA_50) * entry.ewma_50;
+                        entry.runs_since_last_fail = Some(0);
+                        entry.durations.push(dur);
+                        repo_durations.push(dur);
+                        entry.fp_flags.entry(diff_fp).or_insert((false, false)).1 = true;
+                    }
+                    TestStatus::Pass => {
+                        entry.ewma_10 *= 1.0 - EWMA_ALPHA_10;
+                        entry.ewma_50 *= 1.0 - EWMA_ALPHA_50;
+                        if let Some(since) = entry.runs_since_last_fail {
+                            entry.runs_since_last_fail = Some(since + 1);
+                        }
+                        entry.durations.push(dur);
+                        repo_durations.push(dur);
+                        entry.fp_flags.entry(diff_fp).or_insert((false, false)).0 = true;
+                    }
+                    TestStatus::Skip => {
+                        // Skipped runs update total_runs and last_run_ts but do not bias
+                        // failure rates, durations, or flakiness.
+                    }
+                }
+            }
+        }
+
+        snapshot.median_repo_test_ms = median_u64(&mut repo_durations);
+
+        for (test_id, mut acc) in accs {
+            let total_fps = acc.fp_flags.len();
+            let flaky_fps = acc
+                .fp_flags
+                .values()
+                .filter(|&&(has_pass, has_fail)| has_pass && has_fail)
+                .count();
+            let flakiness_rate = if total_fps == 0 {
+                0.0
+            } else {
+                flaky_fps as f64 / total_fps as f64
+            };
+
+            let median_duration_ms = median_u64(&mut acc.durations);
+            snapshot.test_history.insert(
+                test_id.clone(),
+                TestHistory {
+                    test_id,
+                    total_runs: acc.total_runs,
+                    total_failures: acc.total_failures,
+                    ewma_fail_10: acc.ewma_10,
+                    ewma_fail_50: acc.ewma_50,
+                    runs_since_last_fail: acc.runs_since_last_fail,
+                    median_duration_ms,
+                    flakiness_rate,
+                    last_run_ts: acc.last_run_ts,
+                },
+            );
+        }
+
+        // 2. Historical co-failure counts strictly prior to as_of_ts.
+        {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "
+                    SELECT o.test_id, d.file_path,
+                           COUNT(*) AS co_runs,
+                           SUM(CASE WHEN o.status IN ('fail', 'error') THEN 1 ELSE 0 END) AS co_fails
+                    FROM test_outcomes o
+                    JOIN runs r ON r.run_id = o.run_id
+                    JOIN run_diff_files d ON d.run_id = o.run_id
+                    WHERE r.started_at < ?1
+                      AND o.status != 'skip'
+                    GROUP BY o.test_id, d.file_path
+                    ",
+                )
+                .map_err(store_err)?;
+
+            let rows = stmt
+                .query_map(params![as_of_ts], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                })
+                .map_err(store_err)?;
+
+            for row in rows {
+                let (test_id, file_path, co_runs, co_fails) = row.map_err(store_err)?;
+                snapshot.cofail_counts.insert(
+                    (test_id, file_path),
+                    CoFailCounts {
+                        co_fails: co_fails.max(0) as u64,
+                        co_runs: co_runs.max(0) as u64,
+                    },
+                );
+            }
+        }
+
+        // 3. Git co-change frequencies & 30-day file churn strictly prior to as_of_ts.
+        {
+            let cutoff_30d = as_of_ts.saturating_sub(SECONDS_PER_30_DAYS);
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "
+                    SELECT cf.commit_sha, c.commit_ts, cf.file_path
+                    FROM commit_files cf
+                    JOIN commits c ON c.commit_sha = cf.commit_sha
+                    WHERE c.commit_ts < ?1
+                    ORDER BY cf.commit_sha ASC, cf.file_path ASC
+                    ",
+                )
+                .map_err(store_err)?;
+
+            let rows = stmt
+                .query_map(params![as_of_ts], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(store_err)?;
+
+            let mut current_sha: Option<String> = None;
+            let mut current_ts: i64 = 0;
+            let mut current_files: Vec<String> = Vec::new();
+
+            let flush_commit = |commit_ts: i64,
+                                files: &[String],
+                                file_counts: &mut BTreeMap<String, u32>,
+                                pair_counts: &mut BTreeMap<(String, String), u32>,
+                                churn_30d: &mut BTreeMap<String, u32>| {
+                for f in files {
+                    *file_counts.entry(f.clone()).or_insert(0) += 1;
+                    if commit_ts >= cutoff_30d {
+                        *churn_30d.entry(f.clone()).or_insert(0) += 1;
+                    }
+                }
+                if files.len() <= MAX_COCHANGE_FILES_PER_COMMIT {
+                    for i in 0..files.len() {
+                        for j in (i + 1)..files.len() {
+                            *pair_counts
+                                .entry((files[i].clone(), files[j].clone()))
+                                .or_insert(0) += 1;
+                        }
+                    }
+                }
+            };
+
+            for row in rows {
+                let (sha, commit_ts, file_path) = row.map_err(store_err)?;
+                if current_sha.as_deref() != Some(sha.as_str()) {
+                    if !current_files.is_empty() {
+                        flush_commit(
+                            current_ts,
+                            &current_files,
+                            &mut snapshot.file_commit_counts,
+                            &mut snapshot.pair_commit_counts,
+                            &mut snapshot.file_churn_30d,
+                        );
+                        current_files.clear();
+                    }
+                    current_sha = Some(sha);
+                    current_ts = commit_ts;
+                }
+                current_files.push(file_path);
+            }
+
+            if !current_files.is_empty() {
+                flush_commit(
+                    current_ts,
+                    &current_files,
+                    &mut snapshot.file_commit_counts,
+                    &mut snapshot.pair_commit_counts,
+                    &mut snapshot.file_churn_30d,
+                );
+            }
+        }
+
+        Ok(snapshot)
+    }
+}
+
+fn median_u64(values: &mut [u64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_unstable();
+    let mid = values.len() / 2;
+    if values.len() % 2 == 1 {
+        Some(values[mid] as f64)
+    } else {
+        Some((values[mid - 1] as f64 + values[mid] as f64) / 2.0)
     }
 }
 

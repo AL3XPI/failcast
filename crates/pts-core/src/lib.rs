@@ -7,8 +7,8 @@ pub use config::Config;
 pub use error::PtsError;
 pub use runner::TestRunner;
 pub use types::{
-    DiffFile, DiffSummary, RunMode, RunnerResult, SelectionReason, TestCase, TestExecutionOutcome,
-    TestStatus,
+    CoFailCounts, CommitRecord, DiffFile, DiffSummary, HistorySnapshot, RunMode, RunnerResult,
+    SelectionReason, TestCase, TestExecutionOutcome, TestHistory, TestStatus, normalize_posix_path,
 };
 
 #[cfg(test)]
