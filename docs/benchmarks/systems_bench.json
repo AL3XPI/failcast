@@ -1,0 +1,25 @@
+{
+  "environment": {
+    "os": "Darwin",
+    "os_release": "25.6.0",
+    "arch": "arm64",
+    "cpu": "Apple M3 Pro",
+    "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)"
+  },
+  "target_repo": "PyGithub/PyGithub",
+  "discovered_tests": 1232,
+  "selected_tests": 194,
+  "model_mode": "gbdt",
+  "runs": 15,
+  "raw_binary_mb": 10.52,
+  "stripped_binary_mb": 8.22,
+  "dry_run_p50_ms": 1897.23,
+  "dry_run_p95_ms": 2025.0,
+  "explain_test_id": "tests/Connection.py::testRecordAndReplay[http-BODY TEXT]",
+  "explain_p50_ms": 1836.19,
+  "explain_p95_ms": 2011.38,
+  "ml_infer_batch_size": 1000,
+  "ml_infer_p50_ms_per_1000": 1.054,
+  "ml_infer_p95_ms_per_1000": 1.254,
+  "ml_infer_tests_per_sec": 949067.0
+}

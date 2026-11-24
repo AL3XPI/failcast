@@ -182,11 +182,7 @@ impl Store {
         Ok(())
     }
 
-    pub fn insert_run_diff_files(
-        &self,
-        run_id: &str,
-        files: &[DiffFile],
-    ) -> Result<(), PtsError> {
+    pub fn insert_run_diff_files(&self, run_id: &str, files: &[DiffFile]) -> Result<(), PtsError> {
         let mut stmt = self
             .conn
             .prepare(
@@ -873,27 +869,28 @@ impl Store {
             let mut current_ts: i64 = 0;
             let mut current_files: Vec<String> = Vec::new();
 
-            let flush_commit = |commit_ts: i64,
-                                files: &[String],
-                                file_counts: &mut BTreeMap<String, u32>,
-                                pair_counts: &mut BTreeMap<(String, String), u32>,
-                                churn_30d: &mut BTreeMap<String, u32>| {
-                for f in files {
-                    *file_counts.entry(f.clone()).or_insert(0) += 1;
-                    if commit_ts >= cutoff_30d {
-                        *churn_30d.entry(f.clone()).or_insert(0) += 1;
-                    }
-                }
-                if files.len() <= MAX_COCHANGE_FILES_PER_COMMIT {
-                    for i in 0..files.len() {
-                        for j in (i + 1)..files.len() {
-                            *pair_counts
-                                .entry((files[i].clone(), files[j].clone()))
-                                .or_insert(0) += 1;
+            let flush_commit =
+                |commit_ts: i64,
+                 files: &[String],
+                 file_counts: &mut BTreeMap<String, u32>,
+                 pair_counts: &mut BTreeMap<(String, String), u32>,
+                 churn_30d: &mut BTreeMap<String, u32>| {
+                    for f in files {
+                        *file_counts.entry(f.clone()).or_insert(0) += 1;
+                        if commit_ts >= cutoff_30d {
+                            *churn_30d.entry(f.clone()).or_insert(0) += 1;
                         }
                     }
-                }
-            };
+                    if files.len() <= MAX_COCHANGE_FILES_PER_COMMIT {
+                        for i in 0..files.len() {
+                            for j in (i + 1)..files.len() {
+                                *pair_counts
+                                    .entry((files[i].clone(), files[j].clone()))
+                                    .or_insert(0) += 1;
+                            }
+                        }
+                    }
+                };
 
             for row in rows {
                 let (sha, commit_ts, file_path) = row.map_err(store_err)?;

@@ -26,7 +26,9 @@ pub fn is_git_repo(repo_root: &Path) -> bool {
         .arg("rev-parse")
         .arg("--is-inside-work-tree")
         .output()
-        .is_ok_and(|out| out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "true")
+        .is_ok_and(|out| {
+            out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "true"
+        })
 }
 
 /// Computes a deterministic privacy-preserving SHA-256 hex hash of an author identity.

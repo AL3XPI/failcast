@@ -10,17 +10,17 @@ use pts_core::{
     Config, DiffFile, DiffSummary, HistoricalRun, HistorySnapshot, PtsError, RunMode, RunnerResult,
     SelectionReason, TestCase, TestRunner, TestStatus,
 };
-use pts_ml::{
-    CandidateTest, DEFAULT_MEDIAN_DURATION_MS, FEATURE_NAMES, MIN_EFF_DURATION_MS, NUM_FEATURES,
-    SelectedTest, SelectionStrategy, TrainedModel, extract_features, score_heuristic, select_tests,
-    should_use_heuristic,
-};
 use pts_ml::features::{
     IDX_AST_MIN_HOP, IDX_COCHANGE_FREQ_MAX, IDX_COFAIL_RATE_MAX, IDX_DIFF_FILES_COUNT,
     IDX_DIFF_LINES_TOTAL, IDX_DIFF_TOP_DIRS_COUNT, IDX_DIRECT_TEST_MODIFIED, IDX_EWMA_FAIL_10,
     IDX_EWMA_FAIL_50, IDX_FLAKINESS_RATE, IDX_MEDIAN_DURATION_MS, IDX_PATH_JACCARD_MAX,
     IDX_RUNS_SINCE_LAST_FAIL, IDX_SAME_DIR_OVERLAP, IDX_TOTAL_TEST_RUNS,
     IDX_TOUCHED_FILE_CHURN_30D,
+};
+use pts_ml::{
+    CandidateTest, DEFAULT_MEDIAN_DURATION_MS, FEATURE_NAMES, MIN_EFF_DURATION_MS, NUM_FEATURES,
+    SelectedTest, SelectionStrategy, TrainedModel, extract_features, score_heuristic, select_tests,
+    should_use_heuristic,
 };
 use pts_runners::{PytestRunner, normalize_posix_path};
 use pts_store::{RunRecord, Store, TestOutcomeRecord};
@@ -219,9 +219,7 @@ pub fn select_for_working_tree(
     if let SelectionRequest::TargetRecall { target_recall, .. } = request
         && (!target_recall.is_finite() || target_recall <= 0.0 || target_recall >= 1.0)
     {
-        bail!(
-            "target_recall must be strictly between 0.0 and 1.0 (got {target_recall})"
-        );
+        bail!("target_recall must be strictly between 0.0 and 1.0 (got {target_recall})");
     }
 
     let config = Config::load(repo_root)?;
@@ -256,21 +254,20 @@ pub fn select_for_working_tree(
             })
             .collect();
 
-        let (probs, active_model_mode, primary_reason) = if use_gbdt
-            && let Some(ref model) = loaded_model
-        {
-            (
-                model.predict_probs(&feature_rows),
-                "gbdt",
-                SelectionReason::Ranked,
-            )
-        } else {
-            (
-                feature_rows.iter().map(score_heuristic).collect(),
-                "heuristic",
-                SelectionReason::Heuristic,
-            )
-        };
+        let (probs, active_model_mode, primary_reason) =
+            if use_gbdt && let Some(ref model) = loaded_model {
+                (
+                    model.predict_probs(&feature_rows),
+                    "gbdt",
+                    SelectionReason::Ranked,
+                )
+            } else {
+                (
+                    feature_rows.iter().map(score_heuristic).collect(),
+                    "heuristic",
+                    SelectionReason::Heuristic,
+                )
+            };
 
         let candidates: Vec<CandidateTest> = discovered
             .iter()
@@ -390,10 +387,8 @@ pub fn run_selected_tests(
 
     // Ensure every test_id referenced by test_outcomes exists in `tests`.
     let mut tests_to_upsert = plan.discovered;
-    let mut known_ids: HashSet<String> = tests_to_upsert
-        .iter()
-        .map(|t| t.test_id.clone())
-        .collect();
+    let mut known_ids: HashSet<String> =
+        tests_to_upsert.iter().map(|t| t.test_id.clone()).collect();
     for outcome in &result.outcomes {
         if known_ids.insert(outcome.test_id.clone()) {
             let file_path = outcome

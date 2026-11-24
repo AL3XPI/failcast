@@ -1,5 +1,24 @@
 use serde::{Deserialize, Serialize};
 
+/// Default number of equal-width reliability diagram bins over `[0.0, 1.0]`.
+pub const NUM_CALIBRATION_BINS: usize = 10;
+
+/// Single equal-width probability bin in `[0.0, 1.0]` for calibration reliability diagrams.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CalibrationBin {
+    pub bin_center: f64,
+    pub mean_predicted: f64,
+    pub empirical_positive_rate: f64,
+    pub count: usize,
+}
+
+/// Reliability diagram bins comparing raw GBDT sigmoid probabilities against Platt-calibrated probabilities.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CalibrationBins {
+    pub raw_gbdt: Vec<CalibrationBin>,
+    pub platt_calibrated: Vec<CalibrationBin>,
+}
+
 /// Aggregated walk-forward evaluation metrics for a single strategy at a given time budget.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StrategyMetrics {
@@ -20,6 +39,9 @@ pub struct StrategyMetrics {
     pub wall_clock_time_saved: f64,
     /// Mean squared probability error across all evaluated non-skip outcomes.
     pub brier_score: f64,
+    /// Raw GBDT sigmoid Brier score prior to Platt calibration (populated for `PTS (GBDT+Platt)`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uncalibrated_brier_score: Option<f64>,
     /// Average precision (PR-AUC) across all evaluated non-skip outcomes.
     pub pr_auc: f64,
 }
@@ -96,9 +118,59 @@ impl MetricsAccumulator {
             full_suite_duration_ms: self.full_suite_duration_ms,
             wall_clock_time_saved,
             brier_score,
+            uncalibrated_brier_score: None,
             pr_auc,
         }
     }
+}
+
+/// Partitions `(predicted_prob, is_failure)` pairs into `num_bins` equal-width bins over `[0.0, 1.0]`.
+pub fn compute_calibration_bins(
+    predictions: &[(f64, bool)],
+    num_bins: usize,
+) -> Vec<CalibrationBin> {
+    if num_bins == 0 {
+        return Vec::new();
+    }
+
+    let mut counts = vec![0usize; num_bins];
+    let mut sum_preds = vec![0.0_f64; num_bins];
+    let mut pos_counts = vec![0usize; num_bins];
+
+    for &(p, y) in predictions {
+        let clamped = if p.is_finite() {
+            p.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let bin_idx = ((clamped * num_bins as f64).floor() as usize).min(num_bins - 1);
+        counts[bin_idx] += 1;
+        sum_preds[bin_idx] += clamped;
+        if y {
+            pos_counts[bin_idx] += 1;
+        }
+    }
+
+    (0..num_bins)
+        .map(|idx| {
+            let count = counts[idx];
+            let bin_center = (idx as f64 + 0.5) / (num_bins as f64);
+            let (mean_predicted, empirical_positive_rate) = if count > 0 {
+                (
+                    sum_preds[idx] / (count as f64),
+                    pos_counts[idx] as f64 / (count as f64),
+                )
+            } else {
+                (0.0, 0.0)
+            };
+            CalibrationBin {
+                bin_center,
+                mean_predicted,
+                empirical_positive_rate,
+                count,
+            }
+        })
+        .collect()
 }
 
 /// Computes mean squared probability error (Brier score) over `(predicted_prob, is_failure)` pairs.

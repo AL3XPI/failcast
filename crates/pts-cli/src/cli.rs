@@ -396,8 +396,8 @@ fn cmd_eval(repo_root: &Path, args: EvalArgs) -> Result<()> {
         selector_config: config,
     };
 
-    let report = walk_forward_eval(&runs, &commits, &wf_config)
-        .context("walk-forward evaluation failed")?;
+    let report =
+        walk_forward_eval(&runs, &commits, &wf_config).context("walk-forward evaluation failed")?;
 
     print!("{}", report.render_markdown());
 
@@ -500,10 +500,8 @@ fn cmd_backfill(repo_root: &Path, args: BackfillArgs) -> Result<()> {
         let finished_at = started_at.saturating_add((result.total_duration_ms / 1000) as i64);
 
         let mut tests_to_upsert = discovered;
-        let mut known_ids: HashSet<String> = tests_to_upsert
-            .iter()
-            .map(|t| t.test_id.clone())
-            .collect();
+        let mut known_ids: HashSet<String> =
+            tests_to_upsert.iter().map(|t| t.test_id.clone()).collect();
         for outcome in &result.outcomes {
             if known_ids.insert(outcome.test_id.clone()) {
                 let file_path = outcome

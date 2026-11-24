@@ -124,8 +124,11 @@ impl TestRunner for PytestRunner {
         let xml_path = xml_dir.path().join("junit.xml");
 
         let mut cmd = self.base_command(repo_root);
-        cmd.arg(format!("--junitxml={}", xml_path.display()))
-            .args(["-o", "junit_family=legacy", "-q"]);
+        cmd.arg(format!("--junitxml={}", xml_path.display())).args([
+            "-o",
+            "junit_family=legacy",
+            "-q",
+        ]);
 
         if let Some(ids) = selected_ids {
             cmd.args(ids);

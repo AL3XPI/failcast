@@ -116,7 +116,8 @@ impl HistoryAccumulator {
                 for path in &unique_files {
                     *self.file_churn_30d.entry(path.clone()).or_insert(0) += 1;
                 }
-                self.churn_window.push_back((commit.commit_ts, unique_files));
+                self.churn_window
+                    .push_back((commit.commit_ts, unique_files));
             }
 
             self.next_commit_idx += 1;

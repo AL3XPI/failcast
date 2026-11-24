@@ -1,7 +1,5 @@
 use pts_core::{Config, SelectionReason};
-use pts_ml::features::{
-    IDX_AST_MIN_HOP, IDX_DIRECT_TEST_MODIFIED, IDX_EWMA_FAIL_10, NUM_FEATURES,
-};
+use pts_ml::features::{IDX_AST_MIN_HOP, IDX_DIRECT_TEST_MODIFIED, IDX_EWMA_FAIL_10, NUM_FEATURES};
 use pts_ml::{CandidateTest, SelectedTest, SelectionStrategy, ast_hop_decay, select_tests};
 use serde::{Deserialize, Serialize};
 

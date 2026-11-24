@@ -148,7 +148,10 @@ pub fn parse_junit_xml(
             }
             Ok(Event::Text(ref e)) => {
                 if let Some(tc) = current.as_mut()
-                    && matches!(tc.active_detail, ActiveDetail::Failure | ActiveDetail::Error)
+                    && matches!(
+                        tc.active_detail,
+                        ActiveDetail::Failure | ActiveDetail::Error
+                    )
                 {
                     let text = e
                         .unescape()
@@ -158,7 +161,10 @@ pub fn parse_junit_xml(
             }
             Ok(Event::CData(ref e)) => {
                 if let Some(tc) = current.as_mut()
-                    && matches!(tc.active_detail, ActiveDetail::Failure | ActiveDetail::Error)
+                    && matches!(
+                        tc.active_detail,
+                        ActiveDetail::Failure | ActiveDetail::Error
+                    )
                 {
                     let text = String::from_utf8_lossy(e.as_ref());
                     tc.detail_body.push_str(&text);

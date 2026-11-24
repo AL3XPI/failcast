@@ -7,12 +7,17 @@ pub mod walk_forward;
 pub use baselines::{
     RankerKind, score_random_batch, score_recent_failure_rate, score_static_ast, select_for_budget,
 };
-pub use metrics::{MetricsAccumulator, StrategyMetrics, compute_brier_score, compute_pr_auc};
+pub use metrics::{
+    CalibrationBin, CalibrationBins, MetricsAccumulator, NUM_CALIBRATION_BINS, StrategyMetrics,
+    compute_brier_score, compute_calibration_bins, compute_pr_auc,
+};
 pub use walk_forward::{BudgetEvalReport, WalkForwardConfig, WalkForwardReport, walk_forward_eval};
 
 #[cfg(test)]
 pub mod tests {
-    use pts_core::{CommitRecord, Config, DiffFile, DiffSummary, HistoricalOutcome, HistoricalRun, TestStatus};
+    use pts_core::{
+        CommitRecord, Config, DiffFile, DiffSummary, HistoricalOutcome, HistoricalRun, TestStatus,
+    };
 
     use super::*;
 
@@ -151,11 +156,20 @@ pub mod tests {
         };
 
         let report = walk_forward_eval(&runs, &commits, &wf_config).expect("walk_forward_eval");
-        assert!(report.zero_leakage_verified, "zero timestamp leakage must hold");
+        assert!(
+            report.zero_leakage_verified,
+            "zero timestamp leakage must hold"
+        );
         assert_eq!(report.total_runs, 60);
         assert_eq!(report.evaluated_runs, 40);
-        assert!(report.gbdt_steps > 0, "GBDT must be active during walk-forward eval");
-        assert!(report.failing_runs >= 10, "expected substantial failing runs");
+        assert!(
+            report.gbdt_steps > 0,
+            "GBDT must be active during walk-forward eval"
+        );
+        assert!(
+            report.failing_runs >= 10,
+            "expected substantial failing runs"
+        );
 
         let pts_20 = report
             .find_metrics(0.2, RankerKind::PtsGbdt.display_name())
@@ -193,5 +207,170 @@ pub mod tests {
         let parsed: WalkForwardReport =
             serde_json::from_str(&json_str).expect("deserialize report JSON");
         assert_eq!(parsed, report);
+    }
+
+    #[test]
+    fn calibration_bins_sum_to_evaluated_outcomes_and_stay_chronological() {
+        let mut rng = TestRng::new(20260505);
+        let num_runs = 45usize;
+        let tests_per_run = 10usize;
+        let mut runs = Vec::with_capacity(num_runs);
+        let mut commits = Vec::with_capacity(num_runs);
+
+        for r in 0..num_runs {
+            let ts = 1_710_000_000 + (r as i64) * 1800;
+            let touched = r % 5;
+            let diff_files = vec![DiffFile {
+                path: format!("src/pkg_{touched}.py"),
+                lines_added: 12,
+                lines_deleted: 4,
+            }];
+            let diff_fp = DiffSummary::compute_fingerprint(&diff_files);
+            commits.push(CommitRecord {
+                commit_sha: format!("c-{r:04}"),
+                parent_sha: (r > 0).then(|| format!("c-{:04}", r - 1)),
+                author_hash: "dev-1".to_string(),
+                commit_ts: ts - 30,
+                files_changed: 1,
+                lines_added: 12,
+                lines_deleted: 4,
+                files: diff_files.clone(),
+            });
+
+            let mut outcomes = Vec::with_capacity(tests_per_run);
+            for t in 0..tests_per_run {
+                let module_idx = t % 5;
+                let file_path = format!("tests/test_pkg_{module_idx}.py");
+                let status = if t == 9 {
+                    // Include one skipped test per run to confirm bins exclude skips.
+                    TestStatus::Skip
+                } else if (module_idx == touched && t < 5 && rng.next_f64() < 0.75)
+                    || rng.next_f64() < 0.03
+                {
+                    TestStatus::Fail
+                } else {
+                    TestStatus::Pass
+                };
+                outcomes.push(HistoricalOutcome {
+                    test_id: format!("{file_path}::test_{t}"),
+                    file_path,
+                    status,
+                    duration_ms: 100 + (t as u64) * 10,
+                    sampling_propensity: 1.0,
+                    ast_min_hop: if module_idx == touched { Some(1) } else { None },
+                });
+            }
+
+            runs.push(HistoricalRun {
+                run_id: format!("run-{r:04}"),
+                commit_sha: Some(format!("c-{r:04}")),
+                diff_fingerprint: diff_fp,
+                started_at: ts,
+                diff_files,
+                outcomes,
+            });
+        }
+
+        let wf_config = WalkForwardConfig {
+            min_train_runs: 15,
+            retrain_every: 5,
+            budget_fractions: vec![0.2],
+            selector_config: Config::default(),
+        };
+
+        // Pass runs in reverse order to verify strict internal chronological ordering.
+        let mut reversed_runs = runs.clone();
+        reversed_runs.reverse();
+        let report_full =
+            walk_forward_eval(&reversed_runs, &commits, &wf_config).expect("walk_forward_eval");
+        assert!(report_full.zero_leakage_verified);
+        assert_eq!(report_full.evaluated_runs, 30);
+
+        // 30 evaluated runs x 9 non-skip tests per run = 270 evaluated test outcomes.
+        let expected_outcomes = 30 * (tests_per_run - 1);
+        assert_eq!(
+            report_full.calibration_bins.raw_gbdt.len(),
+            NUM_CALIBRATION_BINS
+        );
+        assert_eq!(
+            report_full.calibration_bins.platt_calibrated.len(),
+            NUM_CALIBRATION_BINS
+        );
+
+        let raw_sum: usize = report_full
+            .calibration_bins
+            .raw_gbdt
+            .iter()
+            .map(|b| b.count)
+            .sum();
+        let platt_sum: usize = report_full
+            .calibration_bins
+            .platt_calibrated
+            .iter()
+            .map(|b| b.count)
+            .sum();
+        assert_eq!(raw_sum, expected_outcomes);
+        assert_eq!(platt_sum, expected_outcomes);
+
+        for (idx, bin) in report_full
+            .calibration_bins
+            .platt_calibrated
+            .iter()
+            .enumerate()
+        {
+            let expected_center = (idx as f64 + 0.5) / (NUM_CALIBRATION_BINS as f64);
+            assert!((bin.bin_center - expected_center).abs() < 1e-12);
+            assert!((0.0..=1.0).contains(&bin.mean_predicted));
+            assert!((0.0..=1.0).contains(&bin.empirical_positive_rate));
+        }
+
+        let pts_metrics = report_full
+            .find_metrics(0.2, RankerKind::PtsGbdt.display_name())
+            .expect("PTS metrics");
+        assert!((report_full.brier_score - pts_metrics.brier_score).abs() < 1e-12);
+        assert_eq!(
+            pts_metrics.uncalibrated_brier_score,
+            Some(report_full.uncalibrated_brier_score)
+        );
+        assert!(report_full.uncalibrated_brier_score.is_finite());
+        assert!(report_full.uncalibrated_brier_score >= 0.0);
+
+        // Strict chronological invariance: evaluating a prefix of 30 runs produces the exact same
+        // calibration bins regardless of whether future runs (30..45) exist or have flipped labels.
+        let prefix_report =
+            walk_forward_eval(&runs[..30], &commits, &wf_config).expect("prefix eval");
+        let mut mutated_prefix_with_future = runs.clone();
+        for run in &mut mutated_prefix_with_future[30..] {
+            for outcome in &mut run.outcomes {
+                if outcome.status != TestStatus::Skip {
+                    outcome.status = TestStatus::Fail;
+                }
+            }
+        }
+        let prefix_after_mutation =
+            walk_forward_eval(&mutated_prefix_with_future[..30], &commits, &wf_config)
+                .expect("prefix eval after future mutation");
+        assert_eq!(
+            prefix_report.calibration_bins,
+            prefix_after_mutation.calibration_bins
+        );
+        assert!(
+            (prefix_report.uncalibrated_brier_score
+                - prefix_after_mutation.uncalibrated_brier_score)
+                .abs()
+                < 1e-12
+        );
+
+        // Backwards compatibility: JSON omitting the newly added fields still deserializes cleanly.
+        let mut legacy_json: serde_json::Value =
+            serde_json::to_value(&report_full).expect("serialize to Value");
+        let obj = legacy_json.as_object_mut().expect("root JSON object");
+        obj.remove("brier_score");
+        obj.remove("uncalibrated_brier_score");
+        obj.remove("calibration_bins");
+        let parsed_legacy: WalkForwardReport =
+            serde_json::from_value(legacy_json).expect("deserialize legacy JSON");
+        assert_eq!(parsed_legacy.evaluated_runs, report_full.evaluated_runs);
+        assert!(parsed_legacy.calibration_bins.raw_gbdt.is_empty());
     }
 }

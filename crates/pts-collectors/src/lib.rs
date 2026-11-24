@@ -95,10 +95,7 @@ pub mod tests {
             "test_a -> test_a must be 0 hops"
         );
         assert_eq!(
-            graph.min_hop_to_any(
-                "tests/test_a.py",
-                &["src/pkg/unrelated.py", "src/pkg/b.py"]
-            ),
+            graph.min_hop_to_any("tests/test_a.py", &["src/pkg/unrelated.py", "src/pkg/b.py"]),
             Some(2)
         );
     }
@@ -113,8 +110,11 @@ pub mod tests {
         fs::create_dir_all(root.join("tests")).expect("mkdir tests");
 
         // Commit 1: initial files
-        fs::write(root.join("src/calc.py"), "def add(a, b):\n    return a + b\n")
-            .expect("write calc.py");
+        fs::write(
+            root.join("src/calc.py"),
+            "def add(a, b):\n    return a + b\n",
+        )
+        .expect("write calc.py");
         fs::write(
             root.join("tests/test_calc.py"),
             "def test_add():\n    assert True\n",

@@ -195,17 +195,16 @@ impl TrainedModel {
                 "model artifact feature_names do not match current 16-feature contract".to_string(),
             ));
         }
-        if !artifact.platt_a.is_finite()
-            || !artifact.platt_b.is_finite()
-            || artifact.platt_a < 0.0
+        if !artifact.platt_a.is_finite() || !artifact.platt_b.is_finite() || artifact.platt_a < 0.0
         {
             return Err(PtsError::Parse(
                 "model artifact contains invalid Platt calibration parameters".to_string(),
             ));
         }
 
-        let booster = GradientBooster::from_json(&artifact.booster_json)
-            .map_err(|e| PtsError::Parse(format!("failed to deserialize forust-ml booster: {e}")))?;
+        let booster = GradientBooster::from_json(&artifact.booster_json).map_err(|e| {
+            PtsError::Parse(format!("failed to deserialize forust-ml booster: {e}"))
+        })?;
         let calibrator = PlattCalibrator {
             a: artifact.platt_a,
             b: artifact.platt_b,

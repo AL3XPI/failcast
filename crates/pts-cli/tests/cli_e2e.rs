@@ -245,10 +245,12 @@ mod tests {
                     "SELECT test_id, predicted_prob, selection_reason, sampling_propensity FROM test_outcomes WHERE run_id = ?1 ORDER BY test_id ASC",
                 )
                 .expect("prepare outcomes query");
-            stmt.query_map([run_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
-                .expect("query outcomes")
-                .map(|r| r.expect("outcome row"))
-                .collect()
+            stmt.query_map([run_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .expect("query outcomes")
+            .map(|r| r.expect("outcome row"))
+            .collect()
         };
         assert!(!outcomes.is_empty(), "selected tests must be persisted");
         for (test_id, prob, reason, propensity) in &outcomes {
@@ -410,8 +412,14 @@ mod tests {
             .stdout
             .clone();
         let train_stdout = String::from_utf8_lossy(&train_out);
-        assert!(train_stdout.contains("Platt:"), "train summary must include Platt params");
-        assert!(train_stdout.contains("Brier:"), "train summary must include Brier score");
+        assert!(
+            train_stdout.contains("Platt:"),
+            "train summary must include Platt params"
+        );
+        assert!(
+            train_stdout.contains("Brier:"),
+            "train summary must include Brier score"
+        );
 
         let model_path = tmp.path().join(".pts").join("model.json");
         assert!(model_path.is_file(), ".pts/model.json must be written");
@@ -425,7 +433,10 @@ mod tests {
         let model_rows: i64 = conn
             .query_row("SELECT COUNT(*) FROM models", [], |r| r.get(0))
             .expect("count models");
-        assert_eq!(model_rows, 1, "models table must contain 1 trained model row");
+        assert_eq!(
+            model_rows, 1,
+            "models table must contain 1 trained model row"
+        );
 
         // 4. Modify src/calc.py and run `pts run --budget 5 --dry-run --json` -> assert model_mode == "gbdt".
         let calc_path = tmp.path().join("src/calc.py");
@@ -449,14 +460,22 @@ mod tests {
         // 5. Run `pts eval --output-json report.json` and verify valid JSON and Markdown output.
         let eval_out = cargo_bin_cmd!("pts")
             .current_dir(tmp.path())
-            .args(["eval", "--output-json", "report.json", "--retrain-every", "25"])
+            .args([
+                "eval",
+                "--output-json",
+                "report.json",
+                "--retrain-every",
+                "25",
+            ])
             .assert()
             .success()
             .get_output()
             .stdout
             .clone();
         let eval_md = String::from_utf8_lossy(&eval_out);
-        assert!(eval_md.contains("| Strategy | Commit FDR | Failure Recall | Time Saved | Brier Score | PR-AUC |"));
+        assert!(eval_md.contains(
+            "| Strategy | Commit FDR | Failure Recall | Time Saved | Brier Score | PR-AUC |"
+        ));
         assert!(eval_md.contains("PTS (GBDT+Platt)"));
         assert!(eval_md.contains("Random"));
         assert!(eval_md.contains("StaticAst"));
@@ -468,7 +487,11 @@ mod tests {
         let report_json: serde_json::Value =
             serde_json::from_str(&report_raw).expect("valid report.json");
         assert_eq!(report_json["zero_leakage_verified"], true);
-        assert!(report_json["budgets"].as_array().is_some_and(|b| b.len() == 3));
+        assert!(
+            report_json["budgets"]
+                .as_array()
+                .is_some_and(|b| b.len() == 3)
+        );
     }
 
     #[test]
@@ -528,7 +551,10 @@ mod tests {
                 |r| r.get(0),
             )
             .expect("count backfill runs");
-        assert_eq!(backfill_runs, 2, "expected 2 valid commits backfilled and 1 broken skipped");
+        assert_eq!(
+            backfill_runs, 2,
+            "expected 2 valid commits backfilled and 1 broken skipped"
+        );
 
         // No lingering git worktrees besides the main repo.
         let wt_out = Command::new("git")
@@ -540,7 +566,10 @@ mod tests {
             .lines()
             .filter(|l| l.starts_with("worktree "))
             .count();
-        assert_eq!(wt_count, 1, "temporary backfill worktree must be cleaned up");
+        assert_eq!(
+            wt_count, 1,
+            "temporary backfill worktree must be cleaned up"
+        );
     }
 
     #[test]
@@ -582,7 +611,10 @@ mod tests {
         let prob = report["predicted_fail_prob"]
             .as_f64()
             .expect("predicted_fail_prob must be numeric");
-        assert!(prob > 0.0 && prob < 1.0, "predicted_fail_prob out of (0,1): {prob}");
+        assert!(
+            prob > 0.0 && prob < 1.0,
+            "predicted_fail_prob out of (0,1): {prob}"
+        );
 
         let yield_score = report["yield_score"]
             .as_f64()
@@ -703,8 +735,9 @@ mod tests {
                     continue;
                 }
                 log.push(trimmed.to_string());
-                let val: serde_json::Value = serde_json::from_str(trimmed)
-                    .unwrap_or_else(|e| panic!("non-JSON-RPC line leaked on stdout: `{trimmed}` ({e})"));
+                let val: serde_json::Value = serde_json::from_str(trimmed).unwrap_or_else(|e| {
+                    panic!("non-JSON-RPC line leaked on stdout: `{trimmed}` ({e})")
+                });
                 assert_eq!(
                     val["jsonrpc"], "2.0",
                     "stdout line is not a JSON-RPC 2.0 frame: `{trimmed}`"
@@ -729,7 +762,10 @@ mod tests {
         );
         let init_resp = read_jsonrpc(&mut reader, &mut all_stdout_lines);
         assert_eq!(init_resp["id"], 1);
-        assert!(init_resp.get("error").is_none(), "initialize failed: {init_resp}");
+        assert!(
+            init_resp.get("error").is_none(),
+            "initialize failed: {init_resp}"
+        );
         assert!(
             init_resp["result"]["capabilities"]["tools"].is_object(),
             "server must advertise tools capability: {init_resp}"

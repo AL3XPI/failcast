@@ -14,9 +14,9 @@ pub mod selector;
 pub use accumulator::{HistoryAccumulator, TrainingRow};
 pub use features::{FEATURE_NAMES, NUM_FEATURES, extract_features};
 pub use gbdt::{
-    BOOSTER_PREDICTS_RAW_MARGINS, ChronologicalSplit, GBDT_ITERATIONS, GBDT_L2,
-    GBDT_LEARNING_RATE, GBDT_MAX_DEPTH, GBDT_MIN_LEAF_WEIGHT, GBDT_SEED, MODEL_ARTIFACT_VERSION,
-    ModelArtifact, TrainResult, TrainedModel, build_chronological_split, build_default_booster,
+    BOOSTER_PREDICTS_RAW_MARGINS, ChronologicalSplit, GBDT_ITERATIONS, GBDT_L2, GBDT_LEARNING_RATE,
+    GBDT_MAX_DEPTH, GBDT_MIN_LEAF_WEIGHT, GBDT_SEED, MODEL_ARTIFACT_VERSION, ModelArtifact,
+    TrainResult, TrainedModel, build_chronological_split, build_default_booster,
     inverse_propensity_weight, normalize_to_log_odds, to_column_major, train_gbdt_model,
 };
 pub use heuristic::{ast_hop_decay, score_heuristic, should_use_heuristic};
@@ -430,11 +430,10 @@ pub mod tests {
         let res1 = train_gbdt_model(&runs, &[], 1_700_500_000).expect("first training");
         let res2 = train_gbdt_model(&runs, &[], 1_700_500_000).expect("second training");
 
-        let probe_rows: Vec<[f64; NUM_FEATURES]> =
-            HistoryAccumulator::build_dataset(&runs, &[])
-                .into_iter()
-                .map(|r| r.features)
-                .collect();
+        let probe_rows: Vec<[f64; NUM_FEATURES]> = HistoryAccumulator::build_dataset(&runs, &[])
+            .into_iter()
+            .map(|r| r.features)
+            .collect();
 
         let raw_margins = res1.model.predict_raw_margins(&probe_rows);
         assert!(
@@ -463,7 +462,10 @@ pub mod tests {
 
         let json1 = res1.model.to_json().expect("serialize artifact 1");
         let json2 = res2.model.to_json().expect("serialize artifact 2");
-        assert_eq!(json1, json2, "serialized ModelArtifact must be bit-identical");
+        assert_eq!(
+            json1, json2,
+            "serialized ModelArtifact must be bit-identical"
+        );
 
         // 4. Confirm deserialized model reproduces bit-identical predictions.
         let reloaded = TrainedModel::from_json(&json1).expect("deserialize artifact");
@@ -494,7 +496,11 @@ pub mod tests {
 
         let cal = PlattCalibrator::fit(&raw_logits, &labels, 0.5);
         assert!(cal.a.is_finite() && cal.b.is_finite());
-        assert!(cal.a >= 0.0, "Platt slope a must be non-negative, got {}", cal.a);
+        assert!(
+            cal.a >= 0.0,
+            "Platt slope a must be non-negative, got {}",
+            cal.a
+        );
 
         let cal_probs: Vec<f64> = raw_logits.iter().map(|&z| cal.predict_prob(z)).collect();
         let cal_brier = brier_score(&cal_probs, &labels);
@@ -512,7 +518,8 @@ pub mod tests {
         assert!((inv_cal.b - logit(0.25)).abs() < 1e-12);
 
         // 3. Degenerate 0-positive and 0-negative calibration splits must fall back deterministically without NaN.
-        let zero_pos = PlattCalibrator::fit(&[-1.0, 0.0, 1.0, 2.0], &[false, false, false, false], 0.15);
+        let zero_pos =
+            PlattCalibrator::fit(&[-1.0, 0.0, 1.0, 2.0], &[false, false, false, false], 0.15);
         assert!((zero_pos.a - 1.0).abs() < 1e-12);
         assert!((zero_pos.b - logit(0.15)).abs() < 1e-12);
         assert!(zero_pos.predict_prob(0.5).is_finite());
@@ -541,14 +548,25 @@ pub mod tests {
             split.min_cal_ts
         );
 
-        let train_run_ids: HashSet<&str> = split.train_rows.iter().map(|r| r.run_id.as_str()).collect();
+        let train_run_ids: HashSet<&str> =
+            split.train_rows.iter().map(|r| r.run_id.as_str()).collect();
         let cal_run_ids: HashSet<&str> = split.cal_rows.iter().map(|r| r.run_id.as_str()).collect();
         assert!(
             train_run_ids.is_disjoint(&cal_run_ids),
             "no run_id may appear in both train and calibration splits"
         );
-        assert!(split.train_rows.iter().all(|r| r.started_at <= split.max_train_ts));
-        assert!(split.cal_rows.iter().all(|r| r.started_at >= split.min_cal_ts));
+        assert!(
+            split
+                .train_rows
+                .iter()
+                .all(|r| r.started_at <= split.max_train_ts)
+        );
+        assert!(
+            split
+                .cal_rows
+                .iter()
+                .all(|r| r.started_at >= split.min_cal_ts)
+        );
         assert_eq!(train_run_ids.len() + cal_run_ids.len(), runs.len());
 
         // Verify skipped outcomes were excluded.
@@ -557,7 +575,10 @@ pub mod tests {
             .flat_map(|r| r.outcomes.iter())
             .filter(|o| o.status != TestStatus::Skip)
             .count();
-        assert_eq!(split.train_rows.len() + split.cal_rows.len(), expected_non_skip);
+        assert_eq!(
+            split.train_rows.len() + split.cal_rows.len(),
+            expected_non_skip
+        );
 
         // 2. Verify HistoryAccumulator matches Store::load_history_snapshot at an intermediate cutoff.
         let dir = tempfile::tempdir().expect("tempdir");
@@ -664,7 +685,13 @@ pub mod tests {
                 })
                 .collect();
             store
-                .persist_run_with_outcomes(&run_rec, &run.diff_files, &tests, &outcomes, run.started_at)
+                .persist_run_with_outcomes(
+                    &run_rec,
+                    &run.diff_files,
+                    &tests,
+                    &outcomes,
+                    run.started_at,
+                )
                 .expect("persist run");
         }
 

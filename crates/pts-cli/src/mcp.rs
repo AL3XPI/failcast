@@ -244,11 +244,10 @@ impl PtsMcpServer {
     ) -> Result<Json<ExplainReport>, String> {
         let repo_root = Arc::clone(&self.repo_root);
         let test_id = params.test_id;
-        let report =
-            tokio::task::spawn_blocking(move || explain_test(&repo_root, &test_id))
-                .await
-                .map_err(|e| format!("blocking task panicked: {e}"))?
-                .map_err(|e| format!("{e:#}"))?;
+        let report = tokio::task::spawn_blocking(move || explain_test(&repo_root, &test_id))
+            .await
+            .map_err(|e| format!("blocking task panicked: {e}"))?
+            .map_err(|e| format!("{e:#}"))?;
 
         Ok(Json(report))
     }

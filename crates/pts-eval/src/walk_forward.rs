@@ -7,14 +7,17 @@ use pts_core::{
 };
 use pts_ml::{
     CandidateTest, HistoryAccumulator, NUM_FEATURES, TrainedModel, extract_features,
-    score_heuristic, train_gbdt_model,
+    score_heuristic, sigmoid, train_gbdt_model,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::baselines::{
     RankerKind, score_random_batch, score_recent_failure_rate, score_static_ast, select_for_budget,
 };
-use crate::metrics::{MetricsAccumulator, StrategyMetrics};
+use crate::metrics::{
+    CalibrationBins, MetricsAccumulator, NUM_CALIBRATION_BINS, StrategyMetrics,
+    compute_brier_score, compute_calibration_bins,
+};
 
 const DEFAULT_UNSEEN_STALENESS_DAYS: f64 = 30.0;
 
@@ -56,6 +59,15 @@ pub struct WalkForwardReport {
     pub retrain_every: usize,
     pub gbdt_steps: usize,
     pub zero_leakage_verified: bool,
+    /// Platt-calibrated Brier score across all evaluated non-skip outcomes (`PTS (GBDT+Platt)`).
+    #[serde(default)]
+    pub brier_score: f64,
+    /// Uncalibrated Brier score (raw sigmoid of GBDT margins) across all evaluated non-skip outcomes.
+    #[serde(default)]
+    pub uncalibrated_brier_score: f64,
+    /// 10 equal-width reliability diagram bins in `[0.0, 1.0]` for raw GBDT and Platt-calibrated predictions.
+    #[serde(default)]
+    pub calibration_bins: CalibrationBins,
     pub budgets: Vec<BudgetEvalReport>,
 }
 
@@ -63,10 +75,7 @@ impl WalkForwardReport {
     /// Renders a clean GitHub-flavored Markdown comparison table across all evaluated budgets.
     pub fn render_markdown(&self) -> String {
         let mut out = String::new();
-        let _ = writeln!(
-            out,
-            "# PTS Chronological Walk-Forward Evaluation\n"
-        );
+        let _ = writeln!(out, "# PTS Chronological Walk-Forward Evaluation\n");
         let _ = writeln!(
             out,
             "- **Total runs:** {} | **Evaluated runs:** {} | **Failing runs:** {}",
@@ -74,11 +83,13 @@ impl WalkForwardReport {
         );
         let _ = writeln!(
             out,
-            "- **Warmup runs:** {} | **Retrain cadence:** every {} run(s) | **GBDT steps:** {} | **Zero leakage verified:** {}\n",
-            self.min_train_runs,
-            self.retrain_every,
-            self.gbdt_steps,
-            self.zero_leakage_verified
+            "- **Warmup runs:** {} | **Retrain cadence:** every {} run(s) | **GBDT steps:** {} | **Zero leakage verified:** {}",
+            self.min_train_runs, self.retrain_every, self.gbdt_steps, self.zero_leakage_verified
+        );
+        let _ = writeln!(
+            out,
+            "- **Brier score (Platt-calibrated vs. raw GBDT):** {:.4} vs. {:.4}\n",
+            self.brier_score, self.uncalibrated_brier_score
         );
 
         for budget in &self.budgets {
@@ -91,10 +102,7 @@ impl WalkForwardReport {
                 out,
                 "| Strategy | Commit FDR | Failure Recall | Time Saved | Brier Score | PR-AUC |"
             );
-            let _ = writeln!(
-                out,
-                "| :--- | ---: | ---: | ---: | ---: | ---: |"
-            );
+            let _ = writeln!(out, "| :--- | ---: | ---: | ---: | ---: | ---: |");
             for m in &budget.strategies {
                 let _ = writeln!(
                     out,
@@ -197,6 +205,8 @@ pub fn walk_forward_eval(
     let mut failing_runs = 0usize;
     let mut gbdt_steps = 0usize;
     let mut zero_leakage_verified = true;
+    let mut raw_gbdt_eval_preds: Vec<(f64, bool)> = Vec::new();
+    let mut platt_eval_preds: Vec<(f64, bool)> = Vec::new();
 
     let mut i = start_idx;
     while i < sorted_runs.len() {
@@ -210,7 +220,11 @@ pub fn walk_forward_eval(
 
         // Strict training slice: ONLY runs with `started_at < eval_ts`.
         let train_slice = &sorted_runs[..i];
-        let max_prior_ts = train_slice.iter().map(|r| r.started_at).max().unwrap_or(i64::MIN);
+        let max_prior_ts = train_slice
+            .iter()
+            .map(|r| r.started_at)
+            .max()
+            .unwrap_or(i64::MIN);
         assert!(
             max_prior_ts < eval_ts,
             "chronological anti-leakage violation: max_prior_ts ({max_prior_ts}) >= eval_ts ({eval_ts})"
@@ -317,15 +331,26 @@ pub fn walk_forward_eval(
 
             // Score all 5 strategies on this run's non-skip tests.
             let heuristic_probs: Vec<f64> = feature_rows.iter().map(score_heuristic).collect();
-            let pts_probs: Vec<f64> = match &current_model {
-                Some(model) => model.predict_probs(&feature_rows),
-                None => heuristic_probs.clone(),
+            let (pts_probs, raw_gbdt_probs): (Vec<f64>, Vec<f64>) = match &current_model {
+                Some(model) => {
+                    let raw_margins = model.predict_raw_margins(&feature_rows);
+                    let calibrator = model.calibrator();
+                    let calibrated = raw_margins
+                        .iter()
+                        .map(|&z| calibrator.predict_prob(z))
+                        .collect();
+                    let raw_sigmoid = raw_margins.iter().map(|&z| sigmoid(z)).collect();
+                    (calibrated, raw_sigmoid)
+                }
+                None => (heuristic_probs.clone(), heuristic_probs.clone()),
             };
+            for idx in 0..labels.len() {
+                raw_gbdt_eval_preds.push((raw_gbdt_probs[idx], labels[idx]));
+                platt_eval_preds.push((pts_probs[idx], labels[idx]));
+            }
             let static_ast_probs: Vec<f64> = feature_rows.iter().map(score_static_ast).collect();
-            let recent_fail_probs: Vec<f64> = feature_rows
-                .iter()
-                .map(score_recent_failure_rate)
-                .collect();
+            let recent_fail_probs: Vec<f64> =
+                feature_rows.iter().map(score_recent_failure_rate).collect();
             let random_probs = score_random_batch(&test_ids, &eval_run.diff_fingerprint);
 
             let strategy_probs: [&[f64]; 5] = [
@@ -383,11 +408,8 @@ pub fn walk_forward_eval(
                         }
                     }
 
-                    let pred_pairs: Vec<(f64, bool)> = probs
-                        .iter()
-                        .copied()
-                        .zip(labels.iter().copied())
-                        .collect();
+                    let pred_pairs: Vec<(f64, bool)> =
+                        probs.iter().copied().zip(labels.iter().copied()).collect();
 
                     metrics_grid[b_idx][s_idx].record_run(
                         run_total_failures,
@@ -408,6 +430,13 @@ pub fn walk_forward_eval(
         i = group_end;
     }
 
+    let brier_score = compute_brier_score(&platt_eval_preds);
+    let uncalibrated_brier_score = compute_brier_score(&raw_gbdt_eval_preds);
+    let calibration_bins = CalibrationBins {
+        raw_gbdt: compute_calibration_bins(&raw_gbdt_eval_preds, NUM_CALIBRATION_BINS),
+        platt_calibrated: compute_calibration_bins(&platt_eval_preds, NUM_CALIBRATION_BINS),
+    };
+
     let budgets: Vec<BudgetEvalReport> = config
         .budget_fractions
         .iter()
@@ -416,7 +445,13 @@ pub fn walk_forward_eval(
             let strategies = RankerKind::ALL
                 .iter()
                 .enumerate()
-                .map(|(s_idx, kind)| metrics_grid[b_idx][s_idx].finalize(kind.display_name()))
+                .map(|(s_idx, kind)| {
+                    let mut m = metrics_grid[b_idx][s_idx].finalize(kind.display_name());
+                    if *kind == RankerKind::PtsGbdt {
+                        m.uncalibrated_brier_score = Some(uncalibrated_brier_score);
+                    }
+                    m
+                })
                 .collect();
             BudgetEvalReport {
                 budget_fraction,
@@ -433,6 +468,9 @@ pub fn walk_forward_eval(
         retrain_every,
         gbdt_steps,
         zero_leakage_verified,
+        brier_score,
+        uncalibrated_brier_score,
+        calibration_bins,
         budgets,
     })
 }

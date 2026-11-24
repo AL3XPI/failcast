@@ -361,9 +361,11 @@ pub mod tests {
         assert_eq!(th_150.last_run_ts, Some(100));
 
         // Co-failure counts must exclude t = 200 (src/future.py absent, src/calc.py has 0 fails / 1 run).
-        assert!(!snap_150
-            .cofail_counts
-            .contains_key(&(tc.test_id.clone(), "src/future.py".to_string())));
+        assert!(
+            !snap_150
+                .cofail_counts
+                .contains_key(&(tc.test_id.clone(), "src/future.py".to_string()))
+        );
         let calc_cofail = snap_150
             .cofail_counts
             .get(&(tc.test_id.clone(), "src/calc.py".to_string()))

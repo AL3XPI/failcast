@@ -94,7 +94,9 @@ impl FromStr for SelectionReason {
             "heuristic" => Ok(Self::Heuristic),
             "ranked" => Ok(Self::Ranked),
             "explore" => Ok(Self::Explore),
-            other => Err(PtsError::Parse(format!("invalid selection reason: {other}"))),
+            other => Err(PtsError::Parse(format!(
+                "invalid selection reason: {other}"
+            ))),
         }
     }
 }
