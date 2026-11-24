@@ -64,6 +64,16 @@ pub struct ModelRecord {
     pub artifact_path: String,
 }
 
+/// Complete run payload for atomic multi-run persistence via `Store::persist_runs_batch`.
+#[derive(Debug, Clone)]
+pub struct RunBatchEntry {
+    pub run: RunRecord,
+    pub diff_files: Vec<DiffFile>,
+    pub tests: Vec<TestCase>,
+    pub outcomes: Vec<TestOutcomeRecord>,
+    pub seen_ts: i64,
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -325,6 +335,115 @@ impl Store {
 
         tx.commit().map_err(store_err)?;
         Ok(())
+    }
+
+    /// Persists multiple runs, their diff files, tests, and outcomes inside a single atomic
+    /// SQLite transaction. Used by `pts import-runs` for fast, all-or-nothing JSONL ingestion.
+    pub fn persist_runs_batch(&mut self, runs: &[RunBatchEntry]) -> Result<usize, PtsError> {
+        if runs.is_empty() {
+            return Ok(0);
+        }
+
+        let tx = self.conn.transaction().map_err(store_err)?;
+
+        {
+            let mut run_stmt = tx
+                .prepare(
+                    "
+                    INSERT INTO runs (
+                        run_id, commit_sha, diff_fingerprint, runner, mode,
+                        budget_ms, started_at, finished_at, total_duration_ms, exit_code
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                    ",
+                )
+                .map_err(store_err)?;
+
+            let mut diff_stmt = tx
+                .prepare(
+                    "
+                    INSERT OR REPLACE INTO run_diff_files (run_id, file_path, lines_added, lines_deleted)
+                    VALUES (?1, ?2, ?3, ?4)
+                    ",
+                )
+                .map_err(store_err)?;
+
+            let mut test_stmt = tx
+                .prepare(
+                    "
+                    INSERT INTO tests (test_id, file_path, first_seen_ts, last_seen_ts, active)
+                    VALUES (?1, ?2, ?3, ?3, 1)
+                    ON CONFLICT(test_id) DO UPDATE SET
+                        file_path = excluded.file_path,
+                        last_seen_ts = MAX(tests.last_seen_ts, excluded.last_seen_ts),
+                        active = 1
+                    ",
+                )
+                .map_err(store_err)?;
+
+            let mut outcome_stmt = tx
+                .prepare(
+                    "
+                    INSERT OR REPLACE INTO test_outcomes (
+                        run_id, test_id, status, duration_ms, predicted_prob,
+                        selection_reason, sampling_propensity, failure_excerpt
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                    ",
+                )
+                .map_err(store_err)?;
+
+            for entry in runs {
+                let run = &entry.run;
+                run_stmt
+                    .execute(params![
+                        run.run_id,
+                        run.commit_sha,
+                        run.diff_fingerprint,
+                        run.runner,
+                        run.mode.as_str(),
+                        run.budget_ms,
+                        run.started_at,
+                        run.finished_at,
+                        run.total_duration_ms,
+                        run.exit_code,
+                    ])
+                    .map_err(store_err)?;
+
+                for file in &entry.diff_files {
+                    diff_stmt
+                        .execute(params![
+                            run.run_id,
+                            file.path,
+                            file.lines_added as i64,
+                            file.lines_deleted as i64,
+                        ])
+                        .map_err(store_err)?;
+                }
+
+                for test in &entry.tests {
+                    test_stmt
+                        .execute(params![test.test_id, test.file_path, entry.seen_ts])
+                        .map_err(store_err)?;
+                }
+
+                for outcome in &entry.outcomes {
+                    outcome_stmt
+                        .execute(params![
+                            outcome.run_id,
+                            outcome.test_id,
+                            outcome.status.as_str(),
+                            outcome.duration_ms as i64,
+                            outcome.predicted_prob,
+                            outcome.selection_reason.as_str(),
+                            outcome.sampling_propensity,
+                            outcome.failure_excerpt,
+                        ])
+                        .map_err(store_err)?;
+                }
+            }
+        }
+
+        tx.commit().map_err(store_err)?;
+        Ok(runs.len())
     }
 
     pub fn get_run(&self, run_id: &str) -> Result<Option<RunRecord>, PtsError> {

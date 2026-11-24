@@ -542,4 +542,545 @@ mod tests {
             .count();
         assert_eq!(wt_count, 1, "temporary backfill worktree must be cleaned up");
     }
+
+    #[test]
+    fn cli_explain_outputs_features_and_rationale() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        copy_dir_recursive(&fixture_repo_path(), tmp.path());
+
+        git_cmd(tmp.path(), &["init"]);
+        git_cmd(tmp.path(), &["add", "."]);
+        git_cmd(tmp.path(), &["commit", "-m", "initial fixture commit"]);
+
+        // Make a working-tree edit to src/calc.py (imported at 1 AST hop by tests/test_calc.py).
+        let calc_path = tmp.path().join("src/calc.py");
+        let mut calc_src = fs::read_to_string(&calc_path).expect("read src/calc.py");
+        calc_src.push_str("\n\ndef power(a: int, b: int) -> int:\n    return a ** b\n");
+        fs::write(&calc_path, calc_src).expect("modify src/calc.py");
+
+        cargo_bin_cmd!("pts")
+            .current_dir(tmp.path())
+            .arg("init")
+            .assert()
+            .success();
+
+        // 1. JSON mode: verify schema, scores, and AST hop feature.
+        let json_out = cargo_bin_cmd!("pts")
+            .current_dir(tmp.path())
+            .args(["explain", "tests/test_calc.py::test_add_positive", "--json"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+
+        let report: serde_json::Value =
+            serde_json::from_slice(&json_out).expect("parse pts explain --json output");
+        assert_eq!(report["test_id"], "tests/test_calc.py::test_add_positive");
+        assert_eq!(report["model_mode"], "heuristic");
+
+        let prob = report["predicted_fail_prob"]
+            .as_f64()
+            .expect("predicted_fail_prob must be numeric");
+        assert!(prob > 0.0 && prob < 1.0, "predicted_fail_prob out of (0,1): {prob}");
+
+        let yield_score = report["yield_score"]
+            .as_f64()
+            .expect("yield_score must be numeric");
+        assert!(yield_score > 0.0, "yield_score must be positive");
+        assert!(
+            report["est_duration_ms"].as_u64().unwrap_or(0) >= 50,
+            "est_duration_ms must respect 50ms floor"
+        );
+
+        let features = report["features"]
+            .as_object()
+            .expect("features must be an object");
+        assert_eq!(features.len(), 16, "must include all 16 features");
+        assert_eq!(
+            features["ast_min_hop"].as_f64(),
+            Some(1.0),
+            "expected ast_min_hop == 1.0 for direct import of src/calc.py"
+        );
+        assert_eq!(features["direct_test_modified"].as_f64(), Some(0.0));
+        assert_eq!(features["diff_files_count"].as_f64(), Some(1.0));
+
+        let signals = report["top_signals"]
+            .as_array()
+            .expect("top_signals must be an array");
+        assert!(
+            signals.iter().any(|s| s["feature"] == "ast_min_hop"),
+            "top_signals must highlight ast_min_hop"
+        );
+
+        // 2. Human-readable table output succeeds and includes key sections.
+        let text_out = cargo_bin_cmd!("pts")
+            .current_dir(tmp.path())
+            .args(["explain", "tests/test_calc.py::test_add_positive"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let text = String::from_utf8_lossy(&text_out);
+        assert!(text.contains("Top Contributing Signals:"));
+        assert!(text.contains("16-Feature Breakdown:"));
+        assert!(text.contains("ast_min_hop"));
+
+        // 3. Unknown test ID must exit non-zero with a clear error message.
+        let err_out = cargo_bin_cmd!("pts")
+            .current_dir(tmp.path())
+            .args(["explain", "tests/test_calc.py::test_does_not_exist"])
+            .assert()
+            .failure()
+            .get_output()
+            .stderr
+            .clone();
+        let err_text = String::from_utf8_lossy(&err_out);
+        assert!(
+            err_text.contains("not found"),
+            "expected clear not-found error on stderr, got: {err_text}"
+        );
+    }
+
+    #[test]
+    fn cli_mcp_stdio_jsonrpc_roundtrip_and_stdout_purity() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::process::Stdio;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        copy_dir_recursive(&fixture_repo_path(), tmp.path());
+
+        git_cmd(tmp.path(), &["init"]);
+        git_cmd(tmp.path(), &["add", "."]);
+        git_cmd(tmp.path(), &["commit", "-m", "initial fixture commit"]);
+
+        // Edit src/calc.py so diff_files_count == 1 and ast_min_hop == 1.0.
+        let calc_path = tmp.path().join("src/calc.py");
+        let mut calc_src = fs::read_to_string(&calc_path).expect("read src/calc.py");
+        calc_src.push_str("\n\ndef negate(a: int) -> int:\n    return -a\n");
+        fs::write(&calc_path, calc_src).expect("modify src/calc.py");
+
+        cargo_bin_cmd!("pts")
+            .current_dir(tmp.path())
+            .arg("init")
+            .assert()
+            .success();
+
+        // Spawn the real compiled `pts mcp` binary over piped stdin/stdout/stderr.
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pts"))
+            .arg("mcp")
+            .current_dir(tmp.path())
+            .env("PTS_FIXTURE_FAIL", "1")
+            .env("RUST_LOG", "info")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn `pts mcp`");
+
+        let mut stdin = child.stdin.take().expect("child stdin");
+        let stdout = child.stdout.take().expect("child stdout");
+        let mut reader = BufReader::new(stdout);
+
+        let mut all_stdout_lines: Vec<String> = Vec::new();
+
+        let send_msg = |writer: &mut std::process::ChildStdin, payload: &serde_json::Value| {
+            let line = serde_json::to_string(payload).expect("serialize JSON-RPC message");
+            writeln!(writer, "{line}").expect("write JSON-RPC line to stdin");
+            writer.flush().expect("flush stdin");
+        };
+
+        let read_jsonrpc = |rdr: &mut BufReader<std::process::ChildStdout>,
+                            log: &mut Vec<String>|
+         -> serde_json::Value {
+            loop {
+                let mut line = String::new();
+                let n = rdr.read_line(&mut line).expect("read line from stdout");
+                assert!(n > 0, "unexpected EOF from `pts mcp` stdout");
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                log.push(trimmed.to_string());
+                let val: serde_json::Value = serde_json::from_str(trimmed)
+                    .unwrap_or_else(|e| panic!("non-JSON-RPC line leaked on stdout: `{trimmed}` ({e})"));
+                assert_eq!(
+                    val["jsonrpc"], "2.0",
+                    "stdout line is not a JSON-RPC 2.0 frame: `{trimmed}`"
+                );
+                return val;
+            }
+        };
+
+        // 1. initialize
+        send_msg(
+            &mut stdin,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": { "name": "pts-e2e-test", "version": "0.1.0" }
+                }
+            }),
+        );
+        let init_resp = read_jsonrpc(&mut reader, &mut all_stdout_lines);
+        assert_eq!(init_resp["id"], 1);
+        assert!(init_resp.get("error").is_none(), "initialize failed: {init_resp}");
+        assert!(
+            init_resp["result"]["capabilities"]["tools"].is_object(),
+            "server must advertise tools capability: {init_resp}"
+        );
+
+        // 2. notifications/initialized
+        send_msg(
+            &mut stdin,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+            }),
+        );
+
+        // 3. tools/list
+        send_msg(
+            &mut stdin,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list",
+                "params": {}
+            }),
+        );
+        let list_resp = read_jsonrpc(&mut reader, &mut all_stdout_lines);
+        assert_eq!(list_resp["id"], 2);
+        let tools = list_resp["result"]["tools"]
+            .as_array()
+            .expect("tools/list must return tools array");
+        assert_eq!(tools.len(), 3, "expected exactly 3 MCP tools");
+
+        for expected_name in ["select_tests", "run_fast_tests", "explain_selection"] {
+            let tool = tools
+                .iter()
+                .find(|t| t["name"] == expected_name)
+                .unwrap_or_else(|| panic!("missing tool `{expected_name}` in tools/list"));
+            assert!(
+                tool["inputSchema"].is_object(),
+                "tool `{expected_name}` must expose valid inputSchema"
+            );
+            assert!(
+                tool["outputSchema"].is_object(),
+                "tool `{expected_name}` must expose valid outputSchema"
+            );
+        }
+
+        let extract_tool_json = |resp: &serde_json::Value| -> serde_json::Value {
+            assert!(resp.get("error").is_none(), "JSON-RPC error: {resp}");
+            let result = &resp["result"];
+            assert_ne!(
+                result["isError"],
+                serde_json::Value::Bool(true),
+                "tool call returned isError=true: {resp}"
+            );
+            if let Some(structured) = result.get("structuredContent")
+                && structured.is_object()
+            {
+                return structured.clone();
+            }
+            let text = result["content"][0]["text"]
+                .as_str()
+                .expect("tool result must contain JSON text content");
+            serde_json::from_str(text).expect("parse tool text content as JSON")
+        };
+
+        // 4. tools/call -> select_tests
+        send_msg(
+            &mut stdin,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "select_tests",
+                    "arguments": {
+                        "budget_seconds": 15,
+                        "top_k": null,
+                        "target_recall": null
+                    }
+                }
+            }),
+        );
+        let select_resp = read_jsonrpc(&mut reader, &mut all_stdout_lines);
+        assert_eq!(select_resp["id"], 3);
+        let select_json = extract_tool_json(&select_resp);
+        assert_eq!(select_json["model_mode"], "heuristic");
+        assert_eq!(select_json["diff_files_count"], 1);
+        assert_eq!(select_json["total_discovered_tests"], 4);
+        assert!(select_json["selected_count"].as_u64().unwrap_or(0) >= 1);
+
+        // 5. tools/call -> explain_selection
+        send_msg(
+            &mut stdin,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "explain_selection",
+                    "arguments": {
+                        "test_id": "tests/test_calc.py::test_add_positive"
+                    }
+                }
+            }),
+        );
+        let explain_resp = read_jsonrpc(&mut reader, &mut all_stdout_lines);
+        assert_eq!(explain_resp["id"], 4);
+        let explain_json = extract_tool_json(&explain_resp);
+        assert_eq!(
+            explain_json["test_id"],
+            "tests/test_calc.py::test_add_positive"
+        );
+        assert_eq!(explain_json["features"]["ast_min_hop"].as_f64(), Some(1.0));
+        assert!(explain_json["yield_score"].as_f64().unwrap_or(0.0) > 0.0);
+
+        // 6. tools/call -> run_fast_tests (with PTS_FIXTURE_FAIL=1)
+        send_msg(
+            &mut stdin,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": {
+                    "name": "run_fast_tests",
+                    "arguments": {
+                        "budget_seconds": 15,
+                        "top_k": null,
+                        "run_all": false
+                    }
+                }
+            }),
+        );
+        let run_resp = read_jsonrpc(&mut reader, &mut all_stdout_lines);
+        assert_eq!(run_resp["id"], 5);
+        let run_json = extract_tool_json(&run_resp);
+        let run_id = run_json["run_id"]
+            .as_str()
+            .expect("run_fast_tests must return run_id")
+            .to_string();
+        assert!(!run_id.is_empty());
+        assert_eq!(run_json["failed"], 1, "expected 1 failing test: {run_json}");
+
+        let failures = run_json["failures"]
+            .as_array()
+            .expect("failures must be an array");
+        let divide_fail = failures
+            .iter()
+            .find(|f| f["test_id"] == "tests/test_calc.py::test_divide_broken")
+            .unwrap_or_else(|| panic!("expected test_divide_broken in failures: {run_json}"));
+        let fail_msg = divide_fail["failure_message"]
+            .as_str()
+            .expect("failing test must include failure_message");
+        assert!(!fail_msg.is_empty());
+        assert!(
+            fail_msg.chars().count() <= 1500,
+            "failure_message must be truncated to <= 1500 chars"
+        );
+
+        // Close stdin to cleanly shut down the MCP server, then drain remaining stdout.
+        drop(stdin);
+        let mut trailing = String::new();
+        while reader.read_line(&mut trailing).expect("drain stdout") > 0 {
+            let trimmed = trailing.trim();
+            if !trimmed.is_empty() {
+                let val: serde_json::Value = serde_json::from_str(trimmed).unwrap_or_else(|e| {
+                    panic!("non-JSON-RPC trailing line leaked on stdout: `{trimmed}` ({e})")
+                });
+                assert_eq!(val["jsonrpc"], "2.0");
+                all_stdout_lines.push(trimmed.to_string());
+            }
+            trailing.clear();
+        }
+
+        let status = child.wait().expect("wait for `pts mcp`");
+        assert!(
+            status.success(),
+            "`pts mcp` should exit cleanly on stdin EOF (got {status})"
+        );
+        assert_eq!(
+            all_stdout_lines.len(),
+            5,
+            "expected exactly 5 JSON-RPC responses on stdout"
+        );
+
+        // Verify the run executed via MCP was persisted cleanly to .pts/store.db.
+        let db_path = tmp.path().join(".pts").join("store.db");
+        let conn = Connection::open(&db_path).expect("open store.db");
+        let persisted_exit: i32 = conn
+            .query_row(
+                "SELECT exit_code FROM runs WHERE run_id = ?1",
+                [&run_id],
+                |r| r.get(0),
+            )
+            .expect("query persisted MCP run");
+        assert_eq!(persisted_exit, 1);
+
+        let failed_outcomes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM test_outcomes WHERE run_id = ?1 AND status = 'fail'",
+                [&run_id],
+                |r| r.get(0),
+            )
+            .expect("count failed outcomes");
+        assert_eq!(failed_outcomes, 1);
+    }
+
+    #[test]
+    fn cli_import_runs_jsonl_and_eval_e2e() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        copy_dir_recursive(&fixture_repo_path(), tmp.path());
+
+        git_cmd(tmp.path(), &["init"]);
+        git_cmd(tmp.path(), &["add", "."]);
+        git_cmd(tmp.path(), &["commit", "-m", "initial fixture commit"]);
+
+        cargo_bin_cmd!("pts")
+            .current_dir(tmp.path())
+            .arg("init")
+            .assert()
+            .success();
+
+        // Write a deterministic JSONL history file of 40 chronological CI/PR runs.
+        let mut jsonl = String::new();
+        for r in 0..40usize {
+            let started_at = 1_710_000_000 + (r as i64) * 900;
+            let touches_calc = r % 2 == 0;
+            let is_bug = touches_calc && (r % 4 == 0 || r % 6 == 0);
+
+            let diff_files = if touches_calc {
+                serde_json::json!([
+                    { "path": "src/calc.py", "lines_added": if is_bug { 24 } else { 4 }, "lines_deleted": 2 }
+                ])
+            } else {
+                serde_json::json!([
+                    { "path": "docs/notes.md", "lines_added": 5, "lines_deleted": 1 }
+                ])
+            };
+
+            let line = serde_json::json!({
+                "commit_sha": format!("ci-sha-{r:04}"),
+                "started_at": started_at,
+                "diff_files": diff_files,
+                "outcomes": [
+                    {
+                        "test_id": "tests/test_calc.py::test_add_positive",
+                        "file_path": "tests/test_calc.py",
+                        "status": "pass",
+                        "duration_ms": 75
+                    },
+                    {
+                        "test_id": "tests/test_calc.py::test_add_negative",
+                        "file_path": "tests/test_calc.py",
+                        "status": "pass",
+                        "duration_ms": 85
+                    },
+                    {
+                        "test_id": "tests/test_calc.py::test_divide_broken",
+                        "file_path": "tests/test_calc.py",
+                        "status": if is_bug { "fail" } else { "pass" },
+                        "duration_ms": 130
+                    },
+                    {
+                        "test_id": "tests/test_calc.py::test_skipped_feature",
+                        "file_path": "tests/test_calc.py",
+                        "status": "skip",
+                        "duration_ms": 2
+                    }
+                ]
+            });
+            jsonl.push_str(&serde_json::to_string(&line).expect("serialize JSONL line"));
+            jsonl.push('\n');
+        }
+
+        let jsonl_path = tmp.path().join("ci_history.jsonl");
+        fs::write(&jsonl_path, &jsonl).expect("write ci_history.jsonl");
+
+        // 1. Run `pts import-runs ci_history.jsonl`.
+        cargo_bin_cmd!("pts")
+            .current_dir(tmp.path())
+            .args(["import-runs", "ci_history.jsonl"])
+            .assert()
+            .success();
+
+        // 2. Verify rows persisted in .pts/store.db with mode = 'backfill'.
+        let db_path = tmp.path().join(".pts").join("store.db");
+        let conn = Connection::open(&db_path).expect("open store.db");
+
+        let backfill_runs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM runs WHERE mode = 'backfill'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count imported backfill runs");
+        assert_eq!(backfill_runs, 40);
+
+        let total_outcomes: i64 = conn
+            .query_row("SELECT COUNT(*) FROM test_outcomes", [], |r| r.get(0))
+            .expect("count imported outcomes");
+        assert_eq!(total_outcomes, 160);
+
+        let total_diff_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM run_diff_files", [], |r| r.get(0))
+            .expect("count imported diff files");
+        assert_eq!(total_diff_rows, 40);
+
+        // 3. Run `pts train` on the imported history.
+        cargo_bin_cmd!("pts")
+            .current_dir(tmp.path())
+            .arg("train")
+            .assert()
+            .success();
+        assert!(
+            tmp.path().join(".pts").join("model.json").is_file(),
+            "model.json must be generated from imported runs"
+        );
+
+        // 4. Run `pts eval --output-json report.json` and assert valid benchmark output.
+        let eval_out = cargo_bin_cmd!("pts")
+            .current_dir(tmp.path())
+            .args([
+                "eval",
+                "--output-json",
+                "report.json",
+                "--min-train-runs",
+                "15",
+                "--retrain-every",
+                "10",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let eval_md = String::from_utf8_lossy(&eval_out);
+        assert!(eval_md.contains("PTS (GBDT+Platt)"));
+        assert!(eval_md.contains("Random"));
+        assert!(eval_md.contains("StaticAst"));
+        assert!(eval_md.contains("RecentFailureRate"));
+
+        let report_path = tmp.path().join("report.json");
+        assert!(report_path.is_file(), "report.json must be written");
+        let report_raw = fs::read_to_string(&report_path).expect("read report.json");
+        let report_json: serde_json::Value =
+            serde_json::from_str(&report_raw).expect("valid report.json");
+        assert_eq!(report_json["zero_leakage_verified"], true);
+        assert_eq!(report_json["evaluated_runs"], 25);
+        assert!(
+            report_json["budgets"]
+                .as_array()
+                .is_some_and(|b| b.len() == 3)
+        );
+    }
 }

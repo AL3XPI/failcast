@@ -1,32 +1,32 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use pts_collectors::{
-    ImportGraph, ImportGraphBuilder, PythonImportGraphBuilder, TempGitWorktree,
-    extract_working_diff, is_git_repo, mine_commit_history, mine_commit_history_from_ref,
+    ImportGraphBuilder, PythonImportGraphBuilder, TempGitWorktree, is_git_repo,
+    mine_commit_history, mine_commit_history_from_ref,
 };
 use pts_core::{
-    Config, DiffSummary, HistoricalRun, HistorySnapshot, PtsError, RunMode, RunnerResult,
-    SelectionReason, TestCase, TestRunner, TestStatus,
+    Config, DiffFile, DiffSummary, PtsError, RunMode, SelectionReason, TestCase, TestRunner,
+    TestStatus,
 };
 use pts_eval::{WalkForwardConfig, walk_forward_eval};
-use pts_ml::{
-    CandidateTest, NUM_FEATURES, SelectedTest, SelectionStrategy, TrainedModel, extract_features,
-    score_heuristic, select_tests, should_use_heuristic, train_gbdt_model,
-};
+use pts_ml::{SelectedTest, train_gbdt_model};
 use pts_runners::{PytestRunner, normalize_posix_path};
-use pts_store::{ModelRecord, RunRecord, Store, TestOutcomeRecord};
-use serde::Serialize;
+use pts_store::{ModelRecord, RunBatchEntry, RunRecord, Store, TestOutcomeRecord};
+use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::mcp;
-
-const DEFAULT_UNSEEN_STALENESS_DAYS: f64 = 30.0;
-const MODEL_ARTIFACT_REL_PATH: &str = ".pts/model.json";
+use crate::service::{
+    ExplainReport, MODEL_ARTIFACT_REL_PATH, RunExecutionReport, SelectionRequest, current_unix_ts,
+    explain_test, normalize_diff_files, populate_ast_hops, run_selected_tests,
+    select_for_working_tree, truncate_chars,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -47,13 +47,15 @@ pub enum Command {
     Run(RunArgs),
     /// Train the GBDT + Platt calibration model from .pts/store.db.
     Train,
-    /// Explain the ranking features and score for a specific test (Milestone 4).
-    Explain { test_id: String },
+    /// Explain the 16 ranking features and score rationale for a specific test.
+    Explain(ExplainArgs),
     /// Run chronological walk-forward evaluation against baselines.
     Eval(EvalArgs),
     /// Replay historical git commits in an isolated worktree to populate .pts/store.db.
     Backfill(BackfillArgs),
-    /// Start the local MCP server over stdio (Milestone 4).
+    /// Ingest a JSONL file of historical test runs into .pts/store.db (mode = 'backfill').
+    ImportRuns(ImportRunsArgs),
+    /// Start the local MCP server over stdio.
     Mcp,
 }
 
@@ -97,6 +99,16 @@ pub struct RunArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct ExplainArgs {
+    /// Canonical test identifier (e.g. "tests/test_calc.py::test_add_positive").
+    pub test_id: String,
+
+    /// Emit machine-readable JSON output to stdout.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
 pub struct EvalArgs {
     /// Optional path to write structured JSON evaluation report.
     #[arg(long)]
@@ -126,6 +138,12 @@ pub struct BackfillArgs {
     pub r#ref: String,
 }
 
+#[derive(Debug, Args)]
+pub struct ImportRunsArgs {
+    /// Path to newline-delimited JSON (JSONL) file containing historical CI/PR test runs.
+    pub path: PathBuf,
+}
+
 #[derive(Debug, Serialize)]
 struct DryRunSelectedItem {
     test_id: String,
@@ -147,26 +165,39 @@ struct DryRunJsonReport {
     selected: Vec<DryRunSelectedItem>,
 }
 
-#[derive(Debug, Serialize)]
-struct RunJsonReport {
-    run_id: String,
-    mode: RunMode,
-    model_mode: String,
-    exit_code: i32,
-    total_duration_ms: u64,
-    passed: usize,
-    failed: usize,
-    errored: usize,
-    skipped: usize,
-    total: usize,
-    failures: Vec<FailureSummary>,
+#[derive(Debug, Deserialize)]
+struct ImportRunLine {
+    #[serde(default)]
+    run_id: Option<String>,
+    #[serde(default)]
+    commit_sha: Option<String>,
+    started_at: i64,
+    #[serde(default)]
+    runner: Option<String>,
+    #[serde(default)]
+    diff_files: Vec<ImportDiffFile>,
+    outcomes: Vec<ImportOutcomeLine>,
 }
 
-#[derive(Debug, Serialize)]
-struct FailureSummary {
+#[derive(Debug, Deserialize)]
+struct ImportDiffFile {
+    path: String,
+    #[serde(default)]
+    lines_added: u32,
+    #[serde(default)]
+    lines_deleted: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImportOutcomeLine {
     test_id: String,
+    #[serde(default)]
+    file_path: Option<String>,
+    status: TestStatus,
+    #[serde(default)]
     duration_ms: u64,
-    failure_message: Option<String>,
+    #[serde(default)]
+    failure_excerpt: Option<String>,
 }
 
 /// Executes the parsed CLI command and returns the desired process exit code.
@@ -181,7 +212,10 @@ pub fn execute(cli: Cli, repo_root: &Path) -> Result<i32> {
             cmd_train(repo_root)?;
             Ok(0)
         }
-        Command::Explain { .. } => bail!("`pts explain` is planned for Milestone 4"),
+        Command::Explain(args) => {
+            cmd_explain(repo_root, args)?;
+            Ok(0)
+        }
         Command::Eval(args) => {
             cmd_eval(repo_root, args)?;
             Ok(0)
@@ -190,8 +224,12 @@ pub fn execute(cli: Cli, repo_root: &Path) -> Result<i32> {
             cmd_backfill(repo_root, args)?;
             Ok(0)
         }
+        Command::ImportRuns(args) => {
+            cmd_import_runs(repo_root, args)?;
+            Ok(0)
+        }
         Command::Mcp => {
-            mcp::run_mcp()?;
+            mcp::run_mcp(repo_root)?;
             Ok(0)
         }
     }
@@ -263,7 +301,10 @@ fn cmd_train(repo_root: &Path) -> Result<()> {
     let mut runs = store.load_historical_runs()?;
     let commits = store.load_commits()?;
     if runs.is_empty() {
-        bail!("no historical test runs found in {}; run `pts run --all` or `pts backfill` first", db_path.display());
+        bail!(
+            "no historical test runs found in {}; run `pts run --all`, `pts backfill`, or `pts import-runs` first",
+            db_path.display()
+        );
     }
 
     let graph = PythonImportGraphBuilder::new().build(repo_root)?;
@@ -322,6 +363,12 @@ fn cmd_train(repo_root: &Path) -> Result<()> {
         artifact.platt_a, artifact.platt_b
     );
 
+    Ok(())
+}
+
+fn cmd_explain(repo_root: &Path, args: ExplainArgs) -> Result<()> {
+    let report = explain_test(repo_root, &args.test_id)?;
+    emit_explain_report(&report, args.json)?;
     Ok(())
 }
 
@@ -520,289 +567,184 @@ fn cmd_backfill(repo_root: &Path, args: BackfillArgs) -> Result<()> {
     Ok(())
 }
 
-fn cmd_run(repo_root: &Path, args: RunArgs) -> Result<i32> {
-    if let Some(recall) = args.target_recall
-        && (!recall.is_finite() || recall <= 0.0 || recall >= 1.0)
-    {
-        bail!("--target-recall must be strictly between 0.0 and 1.0 (got {recall})");
-    }
-
-    let config = Config::load(repo_root)?;
+fn cmd_import_runs(repo_root: &Path, args: ImportRunsArgs) -> Result<()> {
     let db_path = repo_root.join(".pts").join("store.db");
-    if !args.dry_run && !db_path.is_file() {
+    if !db_path.is_file() {
         return Err(PtsError::NotInitialized.into());
     }
 
-    let diff = if is_git_repo(repo_root) {
-        extract_working_diff(repo_root)?
+    let config = Config::load(repo_root)?;
+    let resolved = if args.path.is_absolute() {
+        args.path
     } else {
-        warn!(
-            repo = %repo_root.display(),
-            "repository is not a git working tree; using empty diff"
-        );
-        DiffSummary::from_files(None, Vec::new())
+        repo_root.join(&args.path)
     };
 
-    let runner = PytestRunner::from_config(&config);
-    let discovered = runner.discover(repo_root)?;
-    let now_ts = current_unix_ts();
+    let file = File::open(&resolved)
+        .with_context(|| format!("failed to open JSONL file {}", resolved.display()))?;
+    let reader = BufReader::new(file);
 
-    let (mode, mode_label, model_mode, budget_ms, selected_plan): (
-        RunMode,
-        &'static str,
-        &'static str,
-        Option<i64>,
-        Option<Vec<SelectedTest>>,
-    ) = if args.all {
-        (RunMode::All, "all", "full", None, None)
-    } else {
-        let history = if db_path.is_file() {
-            let store = Store::open(&db_path)?;
-            store.load_history_snapshot(now_ts)?
-        } else {
-            HistorySnapshot::default()
-        };
+    let mut batch: Vec<RunBatchEntry> = Vec::new();
+    let mut total_outcomes = 0usize;
 
-        let loaded_model = try_load_model(repo_root);
-        let use_gbdt = !should_use_heuristic(&history, &config, loaded_model.is_some());
+    for (idx, line_res) in reader.lines().enumerate() {
+        let line_no = idx + 1;
+        let line = line_res
+            .with_context(|| format!("failed reading line {line_no} of {}", resolved.display()))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
 
-        let graph = PythonImportGraphBuilder::new().build(repo_root)?;
-        let modified_paths: Vec<&str> = diff.files.iter().map(|f| f.path.as_str()).collect();
-
-        let feature_rows: Vec<[f64; NUM_FEATURES]> = discovered
-            .iter()
-            .map(|tc| {
-                let ast_min_hop = graph.min_hop_to_any(&tc.file_path, &modified_paths);
-                extract_features(tc, &diff, &history, ast_min_hop)
-            })
-            .collect();
-
-        let (probs, active_model_mode, primary_reason) = if use_gbdt
-            && let Some(ref model) = loaded_model
-        {
-            (
-                model.predict_probs(&feature_rows),
-                "gbdt",
-                SelectionReason::Ranked,
+        let parsed: ImportRunLine = serde_json::from_str(trimmed).with_context(|| {
+            format!(
+                "invalid JSONL run record on line {line_no} of {}",
+                resolved.display()
             )
-        } else {
-            (
-                feature_rows.iter().map(score_heuristic).collect(),
-                "heuristic",
-                SelectionReason::Heuristic,
-            )
-        };
+        })?;
 
-        let candidates: Vec<CandidateTest> = discovered
-            .iter()
-            .zip(probs)
-            .map(|(tc, prob)| {
-                let test_hist = history.test_history.get(&tc.test_id);
-                let est_duration_ms = test_hist.and_then(|h| h.median_duration_ms);
-                let days_since_last_run = test_hist
-                    .and_then(|h| h.last_run_ts)
-                    .map(|ts| ((now_ts - ts).max(0) as f64) / 86_400.0)
-                    .unwrap_or(DEFAULT_UNSEEN_STALENESS_DAYS);
-                CandidateTest {
-                    test_id: tc.test_id.clone(),
-                    prob,
-                    est_duration_ms,
-                    days_since_last_run,
-                }
-            })
-            .collect();
+        let run_id = parsed
+            .run_id
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-        let (strategy, run_mode, label, budget_ms_opt) = if let Some(secs) = args.budget {
-            let ms = secs.saturating_mul(1000);
-            (
-                SelectionStrategy::Budget { budget_ms: ms },
-                RunMode::Budget,
-                "budget",
-                Some(ms as i64),
-            )
-        } else if let Some(k) = args.top_k {
-            (SelectionStrategy::TopK { k }, RunMode::TopK, "top_k", None)
-        } else if let Some(recall) = args.target_recall {
-            (
-                SelectionStrategy::TargetRecall {
-                    target_recall: recall,
-                    max_budget_ms: None,
-                },
-                RunMode::Budget,
-                "target_recall",
-                None,
-            )
-        } else {
-            unreachable!("clap ArgGroup guarantees one selection mode is set");
-        };
-
-        let selected = select_tests(
-            &candidates,
-            strategy,
-            &diff.diff_fingerprint,
-            history.median_repo_test_ms,
-            &config,
-            primary_reason,
+        let diff_files = normalize_diff_files(
+            parsed
+                .diff_files
+                .into_iter()
+                .map(|df| DiffFile {
+                    path: df.path,
+                    lines_added: df.lines_added,
+                    lines_deleted: df.lines_deleted,
+                })
+                .collect(),
         );
-        (
-            run_mode,
-            label,
-            active_model_mode,
-            budget_ms_opt,
-            Some(selected),
-        )
+        let diff_fingerprint = DiffSummary::compute_fingerprint(&diff_files);
+
+        let mut tests_to_upsert: Vec<TestCase> = Vec::with_capacity(parsed.outcomes.len());
+        let mut seen_test_ids: HashSet<String> = HashSet::with_capacity(parsed.outcomes.len());
+        let mut outcome_records: Vec<TestOutcomeRecord> = Vec::with_capacity(parsed.outcomes.len());
+        let mut total_duration_ms: u64 = 0;
+        let mut has_failure = false;
+
+        for o in parsed.outcomes {
+            total_duration_ms = total_duration_ms.saturating_add(o.duration_ms);
+            if matches!(o.status, TestStatus::Fail | TestStatus::Error) {
+                has_failure = true;
+            }
+
+            let file_path = o
+                .file_path
+                .as_deref()
+                .filter(|p| !p.trim().is_empty())
+                .map(normalize_posix_path)
+                .unwrap_or_else(|| {
+                    o.test_id
+                        .split("::")
+                        .next()
+                        .map(normalize_posix_path)
+                        .unwrap_or_else(|| o.test_id.clone())
+                });
+
+            if seen_test_ids.insert(o.test_id.clone()) {
+                tests_to_upsert.push(TestCase {
+                    test_id: o.test_id.clone(),
+                    file_path,
+                });
+            }
+
+            let failure_excerpt = o
+                .failure_excerpt
+                .map(|msg| truncate_chars(&msg, config.max_traceback_chars));
+
+            outcome_records.push(TestOutcomeRecord {
+                run_id: run_id.clone(),
+                test_id: o.test_id,
+                status: o.status,
+                duration_ms: o.duration_ms,
+                predicted_prob: None,
+                selection_reason: SelectionReason::Full,
+                sampling_propensity: 1.0,
+                failure_excerpt,
+            });
+        }
+
+        total_outcomes += outcome_records.len();
+        let started_at = parsed.started_at;
+        let finished_at = started_at.saturating_add((total_duration_ms / 1000) as i64);
+
+        let run_record = RunRecord {
+            run_id,
+            commit_sha: parsed.commit_sha,
+            diff_fingerprint,
+            runner: parsed.runner.unwrap_or_else(|| config.runner.clone()),
+            mode: RunMode::Backfill,
+            budget_ms: None,
+            started_at,
+            finished_at: Some(finished_at),
+            total_duration_ms: Some(total_duration_ms as i64),
+            exit_code: Some(if has_failure { 1 } else { 0 }),
+        };
+
+        batch.push(RunBatchEntry {
+            run: run_record,
+            diff_files,
+            tests: tests_to_upsert,
+            outcomes: outcome_records,
+            seen_ts: started_at,
+        });
+    }
+
+    let mut store = Store::open(&db_path)?;
+    store.migrate()?;
+    let imported = store.persist_runs_batch(&batch)?;
+
+    info!(
+        path = %resolved.display(),
+        runs = imported,
+        outcomes = total_outcomes,
+        "imported historical runs from JSONL"
+    );
+    println!(
+        "Imported {imported} run(s) ({total_outcomes} test outcome(s)) from {} into {}",
+        resolved.display(),
+        db_path.display()
+    );
+    Ok(())
+}
+
+fn cmd_run(repo_root: &Path, args: RunArgs) -> Result<i32> {
+    let request = if args.all {
+        SelectionRequest::All
+    } else if let Some(budget_seconds) = args.budget {
+        SelectionRequest::Budget { budget_seconds }
+    } else if let Some(top_k) = args.top_k {
+        SelectionRequest::TopK { top_k }
+    } else if let Some(target_recall) = args.target_recall {
+        SelectionRequest::TargetRecall {
+            target_recall,
+            max_budget_seconds: None,
+        }
+    } else {
+        unreachable!("clap ArgGroup guarantees one selection mode is set");
     };
 
     if args.dry_run {
+        let plan = select_for_working_tree(repo_root, request)?;
         emit_dry_run_report(
-            mode_label,
-            model_mode,
-            diff.files.len(),
-            &discovered,
-            selected_plan.as_deref(),
+            plan.mode_label,
+            plan.model_mode,
+            plan.diff.files.len(),
+            &plan.discovered,
+            plan.selected_plan.as_deref(),
             args.json,
         )?;
         return Ok(0);
     }
 
-    let mut store = Store::open(&db_path)?;
-    store.migrate()?;
-
-    let run_id = Uuid::new_v4().to_string();
-    let started_at = current_unix_ts();
-
-    let result = match &selected_plan {
-        None => runner.execute(repo_root, None)?,
-        Some(plan) if plan.is_empty() => RunnerResult {
-            exit_code: 0,
-            total_duration_ms: 0,
-            outcomes: Vec::new(),
-        },
-        Some(plan) => {
-            let selected_ids: Vec<String> = plan.iter().map(|s| s.test_id.clone()).collect();
-            runner.execute(repo_root, Some(&selected_ids))?
-        }
-    };
-    let finished_at = current_unix_ts().max(started_at);
-
-    // Ensure every test_id referenced by test_outcomes exists in `tests`.
-    let mut tests_to_upsert = discovered;
-    let mut known_ids: HashSet<String> = tests_to_upsert
-        .iter()
-        .map(|t| t.test_id.clone())
-        .collect();
-    for outcome in &result.outcomes {
-        if known_ids.insert(outcome.test_id.clone()) {
-            let file_path = outcome
-                .test_id
-                .split("::")
-                .next()
-                .map(normalize_posix_path)
-                .unwrap_or_else(|| outcome.test_id.clone());
-            tests_to_upsert.push(TestCase {
-                test_id: outcome.test_id.clone(),
-                file_path,
-            });
-        }
-    }
-
-    let selected_by_id: HashMap<&str, &SelectedTest> = selected_plan
-        .as_deref()
-        .unwrap_or(&[])
-        .iter()
-        .map(|s| (s.test_id.as_str(), s))
-        .collect();
-
-    let run_record = RunRecord {
-        run_id: run_id.clone(),
-        commit_sha: diff.base_commit.clone(),
-        diff_fingerprint: diff.diff_fingerprint.clone(),
-        runner: runner.name().to_string(),
-        mode,
-        budget_ms,
-        started_at,
-        finished_at: Some(finished_at),
-        total_duration_ms: Some(result.total_duration_ms as i64),
-        exit_code: Some(result.exit_code),
-    };
-
-    let outcome_records: Vec<TestOutcomeRecord> = result
-        .outcomes
-        .iter()
-        .map(|o| {
-            let (predicted_prob, selection_reason, sampling_propensity) =
-                if let Some(sel) = selected_by_id.get(o.test_id.as_str()) {
-                    (
-                        Some(sel.predicted_prob),
-                        sel.selection_reason,
-                        sel.sampling_propensity,
-                    )
-                } else {
-                    (None, SelectionReason::Full, 1.0)
-                };
-
-            TestOutcomeRecord {
-                run_id: run_id.clone(),
-                test_id: o.test_id.clone(),
-                status: o.status,
-                duration_ms: o.duration_ms,
-                predicted_prob,
-                selection_reason,
-                sampling_propensity,
-                failure_excerpt: o.failure_message.clone(),
-            }
-        })
-        .collect();
-
-    // Invariant 6: Persist outcomes BEFORE emitting report and exiting with runner status.
-    store.persist_run_with_outcomes(
-        &run_record,
-        &diff.files,
-        &tests_to_upsert,
-        &outcome_records,
-        finished_at,
-    )?;
-
-    emit_run_report(&run_id, mode, model_mode, &result, args.json)?;
-    Ok(result.exit_code)
-}
-
-fn try_load_model(repo_root: &Path) -> Option<TrainedModel> {
-    let model_path = repo_root.join(MODEL_ARTIFACT_REL_PATH);
-    if !model_path.is_file() {
-        return None;
-    }
-    let raw = match std::fs::read_to_string(&model_path) {
-        Ok(content) => content,
-        Err(err) => {
-            warn!(
-                path = %model_path.display(),
-                error = %err,
-                "failed to read model artifact; falling back to heuristic"
-            );
-            return None;
-        }
-    };
-    match TrainedModel::from_json(&raw) {
-        Ok(model) => Some(model),
-        Err(err) => {
-            warn!(
-                path = %model_path.display(),
-                error = %err,
-                "invalid model artifact; falling back to heuristic"
-            );
-            None
-        }
-    }
-}
-
-fn populate_ast_hops(runs: &mut [HistoricalRun], graph: &ImportGraph) {
-    for run in runs {
-        let modified_paths: Vec<&str> = run.diff_files.iter().map(|f| f.path.as_str()).collect();
-        for outcome in &mut run.outcomes {
-            outcome.ast_min_hop = graph.min_hop_to_any(&outcome.file_path, &modified_paths);
-        }
-    }
+    let report = run_selected_tests(repo_root, request)?;
+    emit_run_report(&report, args.json)?;
+    Ok(report.exit_code)
 }
 
 fn parse_budgets(raw: &str) -> Result<Vec<f64>> {
@@ -824,6 +766,60 @@ fn parse_budgets(raw: &str) -> Result<Vec<f64>> {
         bail!("--budgets must specify at least one budget fraction in (0.0, 1.0]");
     }
     Ok(budgets)
+}
+
+fn emit_explain_report(report: &ExplainReport, as_json: bool) -> Result<()> {
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+
+    println!("Test:         {}", report.test_id);
+    println!("File:         {}", report.file_path);
+    println!("Model Mode:   {}", report.model_mode);
+    println!("Fail Prob:    {:.4}", report.predicted_fail_prob);
+    if let Some(margin) = report.raw_gbdt_margin {
+        println!("Raw Margin:   {margin:.6}");
+    }
+    println!("Est Duration: {} ms", report.est_duration_ms);
+    println!("Yield Score:  {:.6} prob/ms", report.yield_score);
+    println!("Diff Files:   {}", report.diff_files_count);
+
+    println!("\nTop Contributing Signals:");
+    if report.top_signals.is_empty() {
+        println!("  (no active diff/history signals; baseline prior score)");
+    } else {
+        for signal in &report.top_signals {
+            println!(
+                "  - {:<24} = {:<10} ({})",
+                signal.feature,
+                format_feature_value(Some(signal.value)),
+                signal.description
+            );
+        }
+    }
+
+    println!("\n16-Feature Breakdown:");
+    println!("  {:>2}  {:<26} {:>12}", "#", "Feature", "Value");
+    println!("  {:-<2}  {:-<26} {:-<12}", "", "", "");
+    for (idx, (name, value)) in report.features.as_rows().iter().enumerate() {
+        println!(
+            "  {:>2}  {:<26} {:>12}",
+            idx,
+            name,
+            format_feature_value(*value)
+        );
+    }
+
+    Ok(())
+}
+
+fn format_feature_value(val: Option<f64>) -> String {
+    match val {
+        None => "NaN".to_string(),
+        Some(v) if (v - v.round()).abs() < 1e-9 && v.abs() < 1e9 => format!("{v:.1}"),
+        Some(v) => format!("{v:.4}"),
+    }
 }
 
 fn emit_dry_run_report(
@@ -891,63 +887,23 @@ fn emit_dry_run_report(
     Ok(())
 }
 
-fn emit_run_report(
-    run_id: &str,
-    mode: RunMode,
-    model_mode: &str,
-    result: &RunnerResult,
-    as_json: bool,
-) -> Result<()> {
-    let mut passed = 0usize;
-    let mut failed = 0usize;
-    let mut errored = 0usize;
-    let mut skipped = 0usize;
-    let mut failures = Vec::new();
-
-    for outcome in &result.outcomes {
-        match outcome.status {
-            TestStatus::Pass => passed += 1,
-            TestStatus::Fail => {
-                failed += 1;
-                failures.push(FailureSummary {
-                    test_id: outcome.test_id.clone(),
-                    duration_ms: outcome.duration_ms,
-                    failure_message: outcome.failure_message.clone(),
-                });
-            }
-            TestStatus::Error => {
-                errored += 1;
-                failures.push(FailureSummary {
-                    test_id: outcome.test_id.clone(),
-                    duration_ms: outcome.duration_ms,
-                    failure_message: outcome.failure_message.clone(),
-                });
-            }
-            TestStatus::Skip => skipped += 1,
-        }
-    }
-
+fn emit_run_report(report: &RunExecutionReport, as_json: bool) -> Result<()> {
     if as_json {
-        let report = RunJsonReport {
-            run_id: run_id.to_string(),
-            mode,
-            model_mode: model_mode.to_string(),
-            exit_code: result.exit_code,
-            total_duration_ms: result.total_duration_ms,
-            passed,
-            failed,
-            errored,
-            skipped,
-            total: result.outcomes.len(),
-            failures,
-        };
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        println!("{}", serde_json::to_string_pretty(report)?);
     } else {
         println!(
-            "Run {run_id} (mode={mode}, model={model_mode}): {passed} passed, {failed} failed, {errored} errored, {skipped} skipped in {} ms (exit={})",
-            result.total_duration_ms, result.exit_code
+            "Run {} (mode={}, model={}): {} passed, {} failed, {} errored, {} skipped in {} ms (exit={})",
+            report.run_id,
+            report.mode,
+            report.model_mode,
+            report.passed,
+            report.failed,
+            report.errored,
+            report.skipped,
+            report.total_duration_ms,
+            report.exit_code
         );
-        for f in &failures {
+        for f in &report.failures {
             println!("  FAIL {} ({} ms)", f.test_id, f.duration_ms);
             if let Some(msg) = &f.failure_message
                 && let Some(first_line) = msg.lines().next()
@@ -957,11 +913,4 @@ fn emit_run_report(
         }
     }
     Ok(())
-}
-
-fn current_unix_ts() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }

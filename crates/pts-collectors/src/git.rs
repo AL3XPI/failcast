@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use pts_core::{CommitRecord, DiffFile, DiffSummary, PtsError, normalize_posix_path};
 use sha2::{Digest, Sha256};
@@ -9,12 +9,22 @@ use tempfile::TempDir;
 
 const COMMIT_MARKER: &str = "---PTS-COMMIT---";
 
+/// Creates a `git` subprocess configured with isolated stdio so it never inherits
+/// parent `stdin`/`stdout`/`stderr` (preserving MCP stdio purity).
+fn git_command(dir: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd
+}
+
 /// Returns `true` when `repo_root` is inside a git working tree.
 pub fn is_git_repo(repo_root: &Path) -> bool {
-    Command::new("git")
+    git_command(repo_root)
         .arg("rev-parse")
         .arg("--is-inside-work-tree")
-        .current_dir(repo_root)
         .output()
         .is_ok_and(|out| out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "true")
 }
@@ -41,14 +51,14 @@ pub fn extract_working_diff(repo_root: &Path) -> Result<DiffSummary, PtsError> {
     }
 
     let base_commit = resolve_head_sha(repo_root)?;
-    let mut cmd = Command::new("git");
+    let mut cmd = git_command(repo_root);
     cmd.args(["-c", "core.quotepath=false", "diff"]);
     if base_commit.is_some() {
         cmd.arg("HEAD");
     } else {
         cmd.arg("--cached");
     }
-    cmd.args(["--numstat", "--no-renames"]).current_dir(repo_root);
+    cmd.args(["--numstat", "--no-renames"]);
 
     let output = cmd.output()?;
     if !output.status.success() {
@@ -95,7 +105,7 @@ pub fn mine_commit_history_from_ref(
     }
 
     let format_arg = format!("--format={COMMIT_MARKER}%n%H%x1f%P%x1f%ae%x1f%an%x1f%ct");
-    let output = Command::new("git")
+    let output = git_command(repo_root)
         .args([
             "-c",
             "core.quotepath=false",
@@ -109,7 +119,6 @@ pub fn mine_commit_history_from_ref(
             &format_arg,
             git_ref,
         ])
-        .current_dir(repo_root)
         .output()?;
 
     if !output.status.success() {
@@ -146,9 +155,8 @@ impl TempGitWorktree {
         let worktree_path = tempdir.path().join("worktree");
         let wt_str = worktree_path.to_string_lossy().to_string();
 
-        let output = Command::new("git")
+        let output = git_command(repo_root)
             .args(["worktree", "add", "--detach", &wt_str, commit_sha])
-            .current_dir(repo_root)
             .output()?;
 
         if !output.status.success() {
@@ -171,9 +179,8 @@ impl TempGitWorktree {
     }
 
     pub fn checkout(&self, commit_sha: &str) -> Result<(), PtsError> {
-        let output = Command::new("git")
+        let output = git_command(&self.worktree_path)
             .args(["checkout", "--detach", "--force", commit_sha])
-            .current_dir(&self.worktree_path)
             .output()?;
 
         if !output.status.success() {
@@ -184,9 +191,8 @@ impl TempGitWorktree {
             )));
         }
 
-        let _ = Command::new("git")
+        let _ = git_command(&self.worktree_path)
             .args(["clean", "-fd"])
-            .current_dir(&self.worktree_path)
             .output();
 
         Ok(())
@@ -196,21 +202,18 @@ impl TempGitWorktree {
 impl Drop for TempGitWorktree {
     fn drop(&mut self) {
         let wt_str = self.worktree_path.to_string_lossy().to_string();
-        let _ = Command::new("git")
+        let _ = git_command(&self.repo_root)
             .args(["worktree", "remove", "--force", &wt_str])
-            .current_dir(&self.repo_root)
             .output();
-        let _ = Command::new("git")
+        let _ = git_command(&self.repo_root)
             .args(["worktree", "prune"])
-            .current_dir(&self.repo_root)
             .output();
     }
 }
 
 fn resolve_head_sha(repo_root: &Path) -> Result<Option<String>, PtsError> {
-    let output = Command::new("git")
+    let output = git_command(repo_root)
         .args(["rev-parse", "--verify", "HEAD"])
-        .current_dir(repo_root)
         .output()?;
 
     if output.status.success() {

@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use pts_core::{Config, PtsError, RunnerResult, TestCase, TestRunner};
@@ -46,7 +46,10 @@ impl PytestRunner {
 
     fn base_command(&self, repo_root: &Path) -> Command {
         let mut cmd = Command::new(&self.pytest_bin);
-        cmd.current_dir(repo_root);
+        cmd.current_dir(repo_root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         for (k, v) in &self.extra_env {
             cmd.env(k, v);
         }
