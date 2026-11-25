@@ -1,0 +1,31 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "failcast"
+version = "0.1.0"
+description = "Local Rust CLI and MCP server that predicts which pytest tests will fail for a git diff"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["pytest", "testing", "mcp", "gbdt", "machine-learning", "predictive-testing"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Testing",
+]
+
+[project.urls]
+Homepage = "https://github.com/AL3XPI/failcast"
+Repository = "https://github.com/AL3XPI/failcast"
+Issues = "https://github.com/AL3XPI/failcast/issues"
+
+[tool.maturin]
+bindings = "bin"
+manifest-path = "crates/failcast-cli/Cargo.toml"
+strip = true

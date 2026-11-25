@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect real pre-merge GitHub Actions pytest PR runs into PTS JSONL format.
+"""Collect real pre-merge GitHub Actions pytest PR runs into failcast JSONL format.
 
 Uses only the Python standard library and the `gh` CLI (respecting existing `gh auth`
 credentials and GitHub API rate limits).
@@ -169,7 +169,7 @@ def junit_testcase_to_test_id(classname: str, name: str, file_attr: str = "") ->
 
 
 def parse_junit_xml_bytes(xml_bytes: bytes) -> ParsedOutcomes:
-    """Parse JUnit XML bytes into PTS outcome dicts with exact durations."""
+    """Parse JUnit XML bytes into failcast outcome dicts with exact durations."""
     try:
         root = ET.fromstring(xml_bytes)
     except ET.ParseError:
@@ -267,7 +267,7 @@ def parse_junit_zip_bytes(zip_bytes: bytes) -> ParsedOutcomes:
 
 
 def parse_pytest_log(log_text: str) -> ParsedOutcomes:
-    """Parse verbose pytest job logs (and optional --durations output) into PTS outcomes."""
+    """Parse verbose pytest job logs (and optional --durations output) into failcast outcomes."""
     statuses: dict[str, str] = {}
     excerpts: dict[str, str] = {}
     durations_ms: dict[str, int] = {}
@@ -947,7 +947,7 @@ def collect_runs(
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Collect GitHub Actions PR pytest runs into PTS JSONL format."
+        description="Collect GitHub Actions PR pytest runs into failcast JSONL format."
     )
     parser.add_argument("--repo", required=True, help="GitHub repository in <owner/name> format.")
     parser.add_argument("--out", required=True, type=Path, help="Output JSONL path.")

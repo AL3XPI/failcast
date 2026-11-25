@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate publication-quality README benchmark charts from `pts eval --output-json`.
+"""Generate publication-quality README benchmark charts from `failcast eval --output-json`.
 
 Outputs two 300 DPI, dark/light-theme-readable PNG charts into `--out-dir`:
   1. pareto_fdr_vs_budget.png       (Budget % vs. Commit-Level FDR %)
@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 # Ensure matplotlib can write its font cache even in sandboxed/read-only HOME setups.
-os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "pts-mpl-cache"))
+os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "failcast-mpl-cache"))
 
 import matplotlib
 
@@ -26,7 +26,7 @@ import matplotlib.ticker as mtick
 
 
 STRATEGY_STYLES: dict[str, dict[str, Any]] = {
-    "PTS (GBDT+Platt)": {
+    "Failcast (GBDT+Platt)": {
         "color": "#0F766E",
         "marker": "o",
         "linewidth": 2.8,
@@ -141,7 +141,7 @@ def plot_pareto_fdr_vs_budget(
 
     x_budgets = [float(b["budget_fraction"]) * 100.0 for b in budgets_raw]
     strategy_order = [
-        "PTS (GBDT+Platt)",
+        "Failcast (GBDT+Platt)",
         "Heuristic",
         "StaticAst",
         "RecentFailureRate",
@@ -179,9 +179,9 @@ def plot_pareto_fdr_vs_budget(
         )
         end_points.append((name, ys[-1]))
 
-    if "PTS (GBDT+Platt)" in series:
-        pts_ys = series["PTS (GBDT+Platt)"]
-        for x_val, y_val in zip(x_budgets[: len(pts_ys)], pts_ys):
+    if "Failcast (GBDT+Platt)" in series:
+        failcast_ys = series["Failcast (GBDT+Platt)"]
+        for x_val, y_val in zip(x_budgets[: len(failcast_ys)], failcast_ys):
             ax.annotate(
                 f"{y_val:.0f}%",
                 xy=(x_val, y_val),
@@ -191,7 +191,7 @@ def plot_pareto_fdr_vs_budget(
                 va="bottom" if y_val < 93 else "top",
                 fontsize=8.2,
                 fontweight="bold",
-                color=STRATEGY_STYLES["PTS (GBDT+Platt)"]["color"],
+                color=STRATEGY_STYLES["Failcast (GBDT+Platt)"]["color"],
             )
 
     x_max = max(x_budgets)
@@ -218,12 +218,12 @@ def plot_pareto_fdr_vs_budget(
             f"{name} ({y_actual:.1f}%)",
             color=style["color"],
             fontsize=8.8,
-            fontweight="bold" if name == "PTS (GBDT+Platt)" else "normal",
+            fontweight="bold" if name == "Failcast (GBDT+Platt)" else "normal",
             va="center",
             ha="left",
         )
 
-    ax.set_xlim(max(0.0, x_min - span * 0.06), x_max + span * 0.42)
+    ax.set_xlim(max(0.0, x_min - span * 0.06), x_max + span * 0.48)
     ax.set_ylim(-2.0, 105.0)
     ax.set_xticks(x_budgets)
     ax.xaxis.set_major_formatter(mtick.PercentFormatter(decimals=0))
@@ -399,7 +399,7 @@ def plot_calibration_reliability(
         (
             1,
             platt_bins,
-            "PTS (GBDT + Platt Calibrated)",
+            "Failcast (GBDT + Platt Calibrated)",
             platt_brier,
             "#0F766E",
             "o",
@@ -563,13 +563,13 @@ def plot_calibration_reliability(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Plot PTS walk-forward Pareto and calibration reliability PNG charts."
+        description="Plot Failcast walk-forward Pareto and calibration reliability PNG charts."
     )
     parser.add_argument(
         "--input",
         required=True,
         type=Path,
-        help="Path to JSON report emitted by `pts eval --output-json`.",
+        help="Path to JSON report emitted by `failcast eval --output-json`.",
     )
     parser.add_argument(
         "--out-dir",

@@ -388,6 +388,96 @@ dependencies = [
 ]
 
 [[package]]
+name = "failcast"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "assert_cmd",
+ "clap",
+ "failcast-collectors",
+ "failcast-core",
+ "failcast-eval",
+ "failcast-ml",
+ "failcast-runners",
+ "failcast-store",
+ "predicates",
+ "rmcp",
+ "rusqlite",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "failcast-collectors"
+version = "0.1.0"
+dependencies = [
+ "failcast-core",
+ "sha2 0.10.9",
+ "tempfile",
+ "tree-sitter",
+ "tree-sitter-python",
+]
+
+[[package]]
+name = "failcast-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.21",
+ "toml",
+]
+
+[[package]]
+name = "failcast-eval"
+version = "0.1.0"
+dependencies = [
+ "failcast-core",
+ "failcast-ml",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "failcast-ml"
+version = "0.1.0"
+dependencies = [
+ "failcast-core",
+ "failcast-store",
+ "forust-ml",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "failcast-runners"
+version = "0.1.0"
+dependencies = [
+ "failcast-core",
+ "quick-xml",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "failcast-store"
+version = "0.1.0"
+dependencies = [
+ "failcast-core",
+ "rusqlite",
+ "tempfile",
+]
+
+[[package]]
 name = "fallible-iterator"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -837,96 +927,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "pts-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "assert_cmd",
- "clap",
- "predicates",
- "pts-collectors",
- "pts-core",
- "pts-eval",
- "pts-ml",
- "pts-runners",
- "pts-store",
- "rmcp",
- "rusqlite",
- "schemars",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "pts-collectors"
-version = "0.1.0"
-dependencies = [
- "pts-core",
- "sha2 0.10.9",
- "tempfile",
- "tree-sitter",
- "tree-sitter-python",
-]
-
-[[package]]
-name = "pts-core"
-version = "0.1.0"
-dependencies = [
- "serde",
- "sha2 0.10.9",
- "tempfile",
- "thiserror 2.0.21",
- "toml",
-]
-
-[[package]]
-name = "pts-eval"
-version = "0.1.0"
-dependencies = [
- "pts-core",
- "pts-ml",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "pts-ml"
-version = "0.1.0"
-dependencies = [
- "forust-ml",
- "pts-core",
- "pts-store",
- "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
-name = "pts-runners"
-version = "0.1.0"
-dependencies = [
- "pts-core",
- "quick-xml",
- "tempfile",
- "tracing",
-]
-
-[[package]]
-name = "pts-store"
-version = "0.1.0"
-dependencies = [
- "pts-core",
- "rusqlite",
- "tempfile",
 ]
 
 [[package]]

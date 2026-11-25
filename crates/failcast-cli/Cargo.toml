@@ -1,0 +1,40 @@
+[package]
+name = "failcast"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+description = "Local Rust CLI and MCP server that predicts which pytest tests will fail for a git diff"
+keywords = ["pytest", "testing", "mcp", "gbdt", "failcast"]
+categories = ["development-tools::testing", "command-line-utilities"]
+
+[[bin]]
+name = "failcast"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+failcast-collectors = { workspace = true }
+failcast-core = { workspace = true }
+failcast-eval = { workspace = true }
+failcast-ml = { workspace = true }
+failcast-runners = { workspace = true }
+failcast-store = { workspace = true }
+rmcp = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = { workspace = true }
+predicates = { workspace = true }
+rusqlite = { workspace = true }
+tempfile = { workspace = true }

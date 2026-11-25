@@ -1,57 +1,80 @@
-# pts
+# failcast
 
-[![CI](https://github.com/AL3XPI/pts/actions/workflows/ci.yml/badge.svg)](https://github.com/AL3XPI/pts/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/AL3XPI/pts?include_prereleases)](https://github.com/AL3XPI/pts/releases)
+[![CI](https://github.com/AL3XPI/failcast/actions/workflows/ci.yml/badge.svg)](https://github.com/AL3XPI/failcast/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/AL3XPI/failcast?include_prereleases)](https://github.com/AL3XPI/failcast/releases)
 ![Rust](https://img.shields.io/badge/Rust-2024%20%7C%20rustc%201.98.1-dea584?logo=rust&logoColor=white)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-`pts` is a local Rust CLI and stdio MCP server that reads your working-tree `git diff`, predicts which `pytest` tests are likely to fail, runs the highest-yield ones inside a time or count budget, and stores every outcome in SQLite so future runs get sharper. Everything compiles into one Rust binary (Edition 2024) backed by statically linked bundled `rusqlite`, pure-Rust `forust-ml` gradient-boosted trees with Platt calibration, and a `tree-sitter` file-level Python import graph.
+`failcast` is a local Rust CLI and stdio MCP server that reads your working-tree `git diff`, predicts which `pytest` tests are likely to fail, runs the highest-yield ones inside a time or count budget, and stores every outcome in SQLite so future runs get sharper. Everything compiles into one Rust binary (Edition 2024) backed by statically linked bundled `rusqlite`, pure-Rust `forust-ml` gradient-boosted trees with Platt calibration, and a `tree-sitter` file-level Python import graph.
 
-The selector ranks candidate tests by calibrated failure probability per millisecond (`prob / eff_ms`). A small deterministic exploration pass appends stale tests on top of the greedy budget so neglected parts of the suite stay measured, while inverse-propensity weighting corrects training rows for selection bias. Training and evaluation splits follow chronological run boundaries (`max_train_ts < min_cal_ts < min_eval_ts`) to keep future outcomes out of earlier feature snapshots. One shared internal service layer drives both the CLI (`pts run`, `pts explain`) and the `rmcp` stdio MCP server (`pts mcp`).
+The selector ranks candidate tests by calibrated failure probability per millisecond (`prob / eff_ms`). A small deterministic exploration pass appends stale tests on top of the greedy budget so neglected parts of the suite stay measured, while inverse-propensity weighting corrects training rows for selection bias. Training and evaluation splits follow chronological run boundaries (`max_train_ts < min_cal_ts < min_eval_ts`) to keep future outcomes out of earlier feature snapshots. One shared internal service layer drives both the CLI (`failcast run`, `failcast explain`) and the `rmcp` stdio MCP server (`failcast mcp`).
 
 ## Install & Quickstart
 
-Requires Rust 1.88+ (Edition 2024, tested on `rustc 1.98.1`) and `pytest` on your `PATH` (or configured in `.pts.toml`). Install the binary, add `.pts/` to your repo's `.gitignore`, and seed your first baseline run:
+Download a prebuilt binary for macOS (`aarch64-apple-darwin`), Linux (`x86_64-unknown-linux-gnu`), or Windows (`x86_64-pc-windows-msvc`) from [GitHub Releases](https://github.com/AL3XPI/failcast/releases) (verify with `SHA256SUMS.txt` if desired):
 
 ```bash
-cargo install --path crates/pts-cli
+# macOS (Apple Silicon)
+curl -fsSL https://github.com/AL3XPI/failcast/releases/latest/download/failcast-v0.1.0-aarch64-apple-darwin.tar.gz \
+  | tar -xz -C ~/.local/bin
 
-# Initialize .pts/store.db and mine recent git history for co-change and 30-day churn
-pts init --history-limit 500
+# Linux (x86_64)
+curl -fsSL https://github.com/AL3XPI/failcast/releases/latest/download/failcast-v0.1.0-x86_64-unknown-linux-gnu.tar.gz \
+  | tar -xz -C ~/.local/bin
 
-# Run the full suite once to seed durations and baseline pass/fail history
-pts run --all
-
-# Select and run highest-value tests within a 15-second budget
-pts run --budget 15
-
-# Preview selection without executing tests or writing runs to SQLite (uses discovery cache)
-pts run --budget 15 --dry-run --json
-
-# Force fresh pytest --collect-only discovery (bypasses the SQLite cache)
-pts run --budget 15 --dry-run --refresh-tests --json
-
-# Alternative selection modes
-pts run --top-k 20
-pts run --target-recall 0.95
-
-# Train the GBDT + Platt model once history crosses thresholds (writes .pts/model.json)
-pts train
-
-# Inspect all 16 features, active model mode, calibrated probability, yield score, and top signals
-pts explain tests/test_calc.py::test_add_positive
-pts explain tests/test_calc.py::test_add_positive --json
-
-# Replay stored runs chronologically against Random, StaticAst, and RecentFailureRate
-pts eval --budgets 0.1,0.2,0.3 --min-train-runs 20 --retrain-every 5 --output-json eval_report.json
+# Windows (PowerShell)
+Invoke-WebRequest https://github.com/AL3XPI/failcast/releases/latest/download/failcast-v0.1.0-x86_64-pc-windows-msvc.zip -OutFile failcast.zip
+Expand-Archive failcast.zip -DestinationPath "$env:USERPROFILE\.local\bin" -Force
 ```
 
-When tests fail, `pts run` still parses the JUnit XML and commits every outcome to `.pts/store.db` before returning `pytest`'s non-zero exit code. Until stored history crosses `min_runs_for_ml = 100` and `min_failures_for_ml = 25` (both configurable in `.pts.toml`), `pts` ranks with a cold-start heuristic.
+You can also build from source with Rust 1.88+ (Edition 2024, tested on `rustc 1.98.1`):
+
+```bash
+git clone https://github.com/AL3XPI/failcast.git
+cargo install --path failcast/crates/failcast-cli
+```
+
+Once registry publishing is enabled for `failcast`, `cargo install failcast` (crates.io) and `uvx failcast` / `pipx install failcast` (PyPI binary wheels via `maturin`) will also work directly without building locally.
+
+Running tests requires `pytest` on your `PATH` (or configured in `.failcast.toml`). Add `.failcast/` to your repository's `.gitignore`, initialize the local SQLite store, and seed a baseline run:
+
+```bash
+# Initialize .failcast/store.db and mine recent git history for co-change and 30-day churn
+failcast init --history-limit 500
+
+# Run the full suite once to seed durations and baseline pass/fail history
+failcast run --all
+
+# Select and run highest-value tests within a 15-second budget
+failcast run --budget 15
+
+# Preview selection without executing tests or writing runs to SQLite (uses discovery cache)
+failcast run --budget 15 --dry-run --json
+
+# Force fresh pytest --collect-only discovery (bypasses the SQLite cache)
+failcast run --budget 15 --dry-run --refresh-tests --json
+
+# Alternative selection modes
+failcast run --top-k 20
+failcast run --target-recall 0.95
+
+# Train the GBDT + Platt model once history crosses thresholds (writes .failcast/model.json)
+failcast train
+
+# Inspect all 16 features, active model mode, calibrated probability, yield score, and top signals
+failcast explain tests/test_calc.py::test_add_positive
+failcast explain tests/test_calc.py::test_add_positive --json
+
+# Replay stored runs chronologically against Random, StaticAst, and RecentFailureRate
+failcast eval --budgets 0.1,0.2,0.3 --min-train-runs 20 --retrain-every 5 --output-json eval_report.json
+```
+
+When tests fail, `failcast run` still parses the JUnit XML and commits every outcome to `.failcast/store.db` before returning `pytest`'s non-zero exit code. Until stored history crosses `min_runs_for_ml = 100` and `min_failures_for_ml = 25` (both configurable in `.failcast.toml`), `failcast` ranks with a cold-start heuristic.
 
 <details>
-<summary>Configuration &amp; history import (.pts.toml, backfill, JSONL)</summary>
+<summary>Configuration &amp; history import (.failcast.toml, backfill, JSONL)</summary>
 
-Every key in `.pts.toml` is optional. Copy `.pts.toml.example` to `.pts.toml` at your repository root to override any default:
+Every key in `.failcast.toml` is optional. Copy `.failcast.toml.example` to `.failcast.toml` at your repository root to override any default:
 
 ```toml
 runner = "pytest"
@@ -67,8 +90,8 @@ max_traceback_chars = 1500
 You can populate history from recent commits inside an isolated temporary git worktree so your working tree stays untouched, or load external CI and PR failure logs from a JSONL file in a single SQLite transaction (`mode = 'backfill'`):
 
 ```bash
-pts backfill --commits 50 --ref HEAD
-pts import-runs ci_history.jsonl
+failcast backfill --commits 50 --ref HEAD
+failcast import-runs ci_history.jsonl
 ```
 
 ```json
@@ -87,45 +110,45 @@ Real pre-merge Pull Request runs from [`PyGithub/PyGithub`](https://github.com/P
 
 | Budget | Strategy | Commit FDR | Failure Recall | Time Saved | Brier Score | PR-AUC |
 | ---: | :--- | ---: | ---: | ---: | ---: | ---: |
-| **20%** | **PTS (GBDT+Platt)** | **76.9%** | **93.7%** | **89.8%** | **0.0040** | **0.6894** |
+| **20%** | **Failcast (GBDT+Platt)** | **76.9%** | **93.7%** | **89.8%** | **0.0040** | **0.6894** |
 | 20% | Heuristic | 61.5% | 14.6% | 92.8% | 0.2035 | 0.0115 |
 | 20% | StaticAst | 61.5% | 15.2% | 92.3% | 0.1424 | 0.0059 |
 | 20% | RecentFailureRate | 69.2% | 52.5% | 89.8% | 0.0042 | 0.3085 |
 | 20% | Random | 38.5% | 13.4% | 91.1% | 0.3304 | 0.0051 |
 
-At a 20% duration budget (89.8% wall-clock time saved), PTS catches 93.7% of individual test failures with a 0.6894 PR-AUC (135× Random, 60× Heuristic, 2.23× `RecentFailureRate`). Every strategy's Commit FDR curve stays monotonically non-decreasing as the budget grows.
+At a 20% duration budget (89.8% wall-clock time saved), Failcast catches 93.7% of individual test failures with a 0.6894 PR-AUC (135× Random, 60× Heuristic, 2.23× `RecentFailureRate`). Every strategy's Commit FDR curve stays monotonically non-decreasing as the budget grows.
 
 <details>
 <summary>Full multi-budget table (5%–50%)</summary>
 
 | Budget | Strategy | Commit FDR | Failure Recall | Time Saved | Brier Score | PR-AUC |
 | ---: | :--- | ---: | ---: | ---: | ---: | ---: |
-| **5%** | **PTS (GBDT+Platt)** | **53.8%** | **26.6%** | **97.6%** | **0.0040** | **0.6894** |
+| **5%** | **Failcast (GBDT+Platt)** | **53.8%** | **26.6%** | **97.6%** | **0.0040** | **0.6894** |
 | 5% | Heuristic | 46.2% | 6.3% | 98.8% | 0.2035 | 0.0115 |
 | 5% | StaticAst | 38.5% | 5.1% | 98.8% | 0.1424 | 0.0059 |
 | 5% | RecentFailureRate | 61.5% | 18.2% | 97.2% | 0.0042 | 0.3085 |
 | 5% | Random | 30.8% | 3.0% | 97.9% | 0.3304 | 0.0051 |
-| **10%** | **PTS (GBDT+Platt)** | **69.2%** | **54.6%** | **94.9%** | **0.0040** | **0.6894** |
+| **10%** | **Failcast (GBDT+Platt)** | **69.2%** | **54.6%** | **94.9%** | **0.0040** | **0.6894** |
 | 10% | Heuristic | 46.2% | 9.0% | 97.0% | 0.2035 | 0.0115 |
 | 10% | StaticAst | 38.5% | 5.4% | 97.2% | 0.1424 | 0.0059 |
 | 10% | RecentFailureRate | 69.2% | 30.1% | 94.9% | 0.0042 | 0.3085 |
 | 10% | Random | 38.5% | 7.2% | 95.7% | 0.3304 | 0.0051 |
-| **15%** | **PTS (GBDT+Platt)** | **76.9%** | **80.0%** | **92.3%** | **0.0040** | **0.6894** |
+| **15%** | **Failcast (GBDT+Platt)** | **76.9%** | **80.0%** | **92.3%** | **0.0040** | **0.6894** |
 | 15% | Heuristic | 53.8% | 12.2% | 95.0% | 0.2035 | 0.0115 |
 | 15% | StaticAst | 53.8% | 11.0% | 94.9% | 0.1424 | 0.0059 |
 | 15% | RecentFailureRate | 69.2% | 41.2% | 92.6% | 0.0042 | 0.3085 |
 | 15% | Random | 38.5% | 10.4% | 93.4% | 0.3304 | 0.0051 |
-| **20%** | **PTS (GBDT+Platt)** | **76.9%** | **93.7%** | **89.8%** | **0.0040** | **0.6894** |
+| **20%** | **Failcast (GBDT+Platt)** | **76.9%** | **93.7%** | **89.8%** | **0.0040** | **0.6894** |
 | 20% | Heuristic | 61.5% | 14.6% | 92.8% | 0.2035 | 0.0115 |
 | 20% | StaticAst | 61.5% | 15.2% | 92.3% | 0.1424 | 0.0059 |
 | 20% | RecentFailureRate | 69.2% | 52.5% | 89.8% | 0.0042 | 0.3085 |
 | 20% | Random | 38.5% | 13.4% | 91.1% | 0.3304 | 0.0051 |
-| **30%** | **PTS (GBDT+Platt)** | **76.9%** | **94.3%** | **83.6%** | **0.0040** | **0.6894** |
+| **30%** | **Failcast (GBDT+Platt)** | **76.9%** | **94.3%** | **83.6%** | **0.0040** | **0.6894** |
 | 30% | Heuristic | 69.2% | 16.7% | 88.5% | 0.2035 | 0.0115 |
 | 30% | StaticAst | 61.5% | 19.1% | 87.9% | 0.1424 | 0.0059 |
 | 30% | RecentFailureRate | 69.2% | 56.4% | 83.9% | 0.0042 | 0.3085 |
 | 30% | Random | 53.8% | 20.6% | 86.3% | 0.3304 | 0.0051 |
-| **50%** | **PTS (GBDT+Platt)** | **76.9%** | **95.5%** | **71.3%** | **0.0040** | **0.6894** |
+| **50%** | **Failcast (GBDT+Platt)** | **76.9%** | **95.5%** | **71.3%** | **0.0040** | **0.6894** |
 | 50% | Heuristic | 69.2% | 23.9% | 78.9% | 0.2035 | 0.0115 |
 | 50% | StaticAst | 69.2% | 28.1% | 79.2% | 0.1424 | 0.0059 |
 | 50% | RecentFailureRate | 69.2% | 62.7% | 70.6% | 0.0042 | 0.3085 |
@@ -139,12 +162,12 @@ Measured on an Apple M3 Pro (macOS arm64, `rustc 1.98.1 (48a229cea 2026-09-01)`)
 
 | Execution Path | Metric | Value | Notes |
 | :--- | :--- | ---: | :--- |
-| **Binary Footprint** | Stripped release binary (`pts`) | **8.26 MB** | Unstripped: 10.55 MB (static SQLite + `forust-ml` GBDT + Tree-sitter + `rmcp`) |
-| **Warm Rust Core** | `pts run --budget 15 --dry-run --json` (p50 / p95) | **398.3 ms / 503.1 ms** | Cached SQLite discovery (**2.2× faster** than cold; `git diff` + SQLite + AST + GBDT+Platt) |
-| **Warm Rust Core** | `pts explain <test_id> --json` (p50 / p95) | **357.2 ms / 364.6 ms** | Cached SQLite discovery (**2.4× faster** than cold; 16 features + signals + Platt prob) |
-| **Cold `pytest` Discovery** | `pts run --budget 15 --dry-run --refresh-tests --json` (p50 / p95) | **874.3 ms / 925.3 ms** | Includes external Python + `pytest --collect-only` startup across 1,232 tests |
-| **Cold `pytest` Discovery** | `pts explain <test_id> --refresh-tests --json` (p50 / p95) | **865.4 ms / 899.7 ms** | Includes external Python + `pytest --collect-only` startup |
-| **Pure ML Core** | `pts-ml` scoring latency (1,000 tests, p50 / p95) | **1.10 ms / 1.50 ms** | **905,182 tests/sec** (150-tree GBDT + Platt calibration via `bench_infer`) |
+| **Binary Footprint** | Stripped release binary (`failcast`) | **8.26 MB** | Unstripped: 10.55 MB (static SQLite + `forust-ml` GBDT + Tree-sitter + `rmcp`) |
+| **Warm Rust Core** | `failcast run --budget 15 --dry-run --json` (p50 / p95) | **398.3 ms / 503.1 ms** | Cached SQLite discovery (**2.2× faster** than cold; `git diff` + SQLite + AST + GBDT+Platt) |
+| **Warm Rust Core** | `failcast explain <test_id> --json` (p50 / p95) | **357.2 ms / 364.6 ms** | Cached SQLite discovery (**2.4× faster** than cold; 16 features + signals + Platt prob) |
+| **Cold `pytest` Discovery** | `failcast run --budget 15 --dry-run --refresh-tests --json` (p50 / p95) | **874.3 ms / 925.3 ms** | Includes external Python + `pytest --collect-only` startup across 1,232 tests |
+| **Cold `pytest` Discovery** | `failcast explain <test_id> --refresh-tests --json` (p50 / p95) | **865.4 ms / 899.7 ms** | Includes external Python + `pytest --collect-only` startup |
+| **Pure ML Core** | `failcast-ml` scoring latency (1,000 tests, p50 / p95) | **1.10 ms / 1.50 ms** | **905,182 tests/sec** (150-tree GBDT + Platt calibration via `bench_infer`) |
 
 <details>
 <summary>Probability Calibration Reliability</summary>
@@ -158,7 +181,7 @@ Across all 68,695 evaluated non-skip outcomes, Platt calibration with the suppor
 <details>
 <summary>Implementation Notes</summary>
 
-Spawning Python and `pytest --collect-only` on `PyGithub/PyGithub` burns roughly 500 ms before Rust does any work, and heavier Python dependency graphs easily hit 1.5 to 2 seconds. Hashing test and pytest config file metadata into SQLite (`repo_meta["discovery_fingerprint"]`) keeps repeat `pts run` and `pts explain` calls inside Rust at 357 to 398 ms p50 end-to-end (with 1.10 ms per 1,000 tests spent in GBDT+Platt scoring) and invalidates automatically whenever a test or pytest config file changes.
+Spawning Python and `pytest --collect-only` on `PyGithub/PyGithub` burns roughly 500 ms before Rust does any work, and heavier Python dependency graphs easily hit 1.5 to 2 seconds. Hashing test and pytest config file metadata into SQLite (`repo_meta["discovery_fingerprint"]`) keeps repeat `failcast run` and `failcast explain` calls inside Rust at 357 to 398 ms p50 end-to-end (with 1.10 ms per 1,000 tests spent in GBDT+Platt scoring) and invalidates automatically whenever a test or pytest config file changes.
 
 Wall-clock time saved exceeds `1 - budget` on fast unit suites because the selector clamps every test's effective duration to at least 50 ms (`MIN_EFF_DURATION_MS = 50.0`). Without that floor, sub-millisecond tests get huge `prob / dur` yield ratios and crowd out slower tests that actually break. `PyGithub`'s unit tests have a 20 to 30 ms median runtime, so a 20% nominal budget picks fewer ultra-fast tests than `20% / 25ms`, saving 89.8% of actual wall-clock time while catching 93.7% of individual failures.
 
@@ -167,10 +190,10 @@ Real CI histories have heavy class imbalance, often under 0.5% failing execution
 </details>
 
 <details>
-<summary>Example <code>pts explain</code> Output (PyGithub/PyGithub)</summary>
+<summary>Example <code>failcast explain</code> Output (PyGithub/PyGithub)</summary>
 
 ```text
-$ pts explain tests/PullRequest.py::PullRequest::testAttributes
+$ failcast explain tests/PullRequest.py::PullRequest::testAttributes
 Test:         tests/PullRequest.py::PullRequest::testAttributes
 File:         tests/PullRequest.py
 Model Mode:   gbdt
@@ -222,35 +245,35 @@ python3 scripts/collect_gha_pytest.py \
 # Initialize, import, evaluate, and plot against a local checkout of the target repo
 git clone https://github.com/PyGithub/PyGithub ../PyGithub
 (cd ../PyGithub \
-  && pts init --history-limit 1000 \
-  && pts import-runs ../pts/bench-data/pr_runs.jsonl \
-  && pts eval --budgets 0.05,0.1,0.15,0.2,0.3,0.5 --output-json ../pts/docs/benchmarks/eval_report.json)
+  && failcast init --history-limit 1000 \
+  && failcast import-runs ../failcast/bench-data/pr_runs.jsonl \
+  && failcast eval --budgets 0.05,0.1,0.15,0.2,0.3,0.5 --output-json ../failcast/docs/benchmarks/eval_report.json)
 
 python3 scripts/plot_benchmarks.py --input docs/benchmarks/eval_report.json --out-dir docs/benchmarks --repo-label "PyGithub/PyGithub"
 
-# Measure release binary footprint, CLI latency, and pure pts-ml inference throughput
+# Measure release binary footprint, CLI latency, and pure failcast-ml inference throughput
 python3 scripts/bench_systems.py --repo-dir ../PyGithub --runs 15 --out-json docs/benchmarks/systems_bench.json
 ```
 
 </details>
 
-## MCP Server (`pts mcp`)
+## MCP Server (`failcast mcp`)
 
-`pts mcp` serves a local [Model Context Protocol](https://modelcontextprotocol.io) endpoint over `stdio` using `rmcp`. JSON-RPC 2.0 frames own `stdout`, while tracing logs and subprocess diagnostics route to `stderr` or captured pipes.
+`failcast mcp` serves a local [Model Context Protocol](https://modelcontextprotocol.io) endpoint over `stdio` using `rmcp`. JSON-RPC 2.0 frames own `stdout`, while tracing logs and subprocess diagnostics route to `stderr` or captured pipes.
 
 | Tool | Description |
 | :--- | :--- |
 | `select_tests` | Dry-run test selection for the current working-tree diff (`budget_seconds`, `top_k`, `target_recall`, `refresh_tests`). |
-| `run_fast_tests` | Select and execute tests within a budget or top-k limit, persist outcomes to `.pts/store.db`, and return structured pass/fail counts with bounded tracebacks (`budget_seconds`, `top_k`, `run_all`, `refresh_tests`). |
+| `run_fast_tests` | Select and execute tests within a budget or top-k limit, persist outcomes to `.failcast/store.db`, and return structured pass/fail counts with bounded tracebacks (`budget_seconds`, `top_k`, `run_all`, `refresh_tests`). |
 | `explain_selection` | Return all 16 features, active model mode, calibrated failure probability, yield score, and top contributing signals for a specific `test_id` (`test_id`, `refresh_tests`). |
 
-Point your MCP client (Claude Desktop, Cursor, Claude Code, Antigravity) at `pts mcp` with `cwd` set to the Python repo you are working in:
+Point your MCP client (Claude Desktop, Cursor, Claude Code, Antigravity) at `failcast mcp` with `cwd` set to the Python repo you are working in:
 
 ```json
 {
   "mcpServers": {
-    "pts": {
-      "command": "pts",
+    "failcast": {
+      "command": "failcast",
       "args": ["mcp"],
       "cwd": "/path/to/your/python-repo"
     }
@@ -262,20 +285,20 @@ Point your MCP client (Claude Desktop, Cursor, Claude Code, Antigravity) at `pts
 
 | Crate | Responsibility |
 | :--- | :--- |
-| `pts-core` | Pure domain types (`TestCase`, `DiffSummary`, `HistorySnapshot`, `Config`, `TestRunner`, `PtsError`). Zero I/O or subprocesses. |
-| `pts-store` | Bundled SQLite store in WAL mode, schema migrations, atomic run/batch writes, and point-in-time (`< as_of_ts`) history queries. |
-| `pts-collectors` | Working-tree `git diff` and `git log` mining, isolated `TempGitWorktree` for commit backfills, and a Tree-sitter Python file-level import graph. |
-| `pts-ml` | 16-feature extractor, cold-start heuristic ranker, `forust-ml` GBDT trainer, Newton-Raphson Platt calibrator, and deterministic cost-aware selector. |
-| `pts-runners` | `TestRunner` implementation for `pytest` with JUnit XML parsing and bounded failure tracebacks. |
-| `pts-eval` | Chronological walk-forward evaluator comparing PTS against `Random`, `StaticAst`, and `RecentFailureRate` baselines. |
-| `pts-cli` | The `pts` binary: shared `service.rs`, Clap subcommands, JSONL CI importer, and `rmcp` stdio MCP server. |
+| `failcast-core` | Pure domain types (`TestCase`, `DiffSummary`, `HistorySnapshot`, `Config`, `TestRunner`, `FailcastError`). Zero I/O or subprocesses. |
+| `failcast-store` | Bundled SQLite store in WAL mode, schema migrations, atomic run/batch writes, and point-in-time (`< as_of_ts`) history queries. |
+| `failcast-collectors` | Working-tree `git diff` and `git log` mining, isolated `TempGitWorktree` for commit backfills, and a Tree-sitter Python file-level import graph. |
+| `failcast-ml` | 16-feature extractor, cold-start heuristic ranker, `forust-ml` GBDT trainer, Newton-Raphson Platt calibrator, and deterministic cost-aware selector. |
+| `failcast-runners` | `TestRunner` implementation for `pytest` with JUnit XML parsing and bounded failure tracebacks. |
+| `failcast-eval` | Chronological walk-forward evaluator comparing Failcast against `Random`, `StaticAst`, and `RecentFailureRate` baselines. |
+| `failcast` (`crates/failcast-cli`) | The `failcast` binary: shared `service.rs`, Clap subcommands, JSONL CI importer, and `rmcp` stdio MCP server. |
 
 <details>
 <summary>Dependency graph</summary>
 
 ```text
                     +-------------------------------------------+
-                    |             pts (pts-cli)                 |
+                    |        failcast (crates/failcast-cli)     |
                     |   Clap CLI    |  service.rs  |  rmcp MCP  |
                     +---------------+------+-------+------------+
                                            |
@@ -283,7 +306,7 @@ Point your MCP client (Claude Desktop, Cursor, Claude Code, Antigravity) at `pts
           |                                |                                |
           v                                v                                v
 +--------------------+         +-----------------------+         +---------------------+
-|   pts-collectors   |         |        pts-ml         |         |     pts-runners     |
+| failcast-collectors|         |      failcast-ml      |         |  failcast-runners   |
 | - git diff/history |         | - 16 pure features    |         | - PytestRunner      |
 | - tree-sitter Py   |         | - Cold-start ranker   |         | - JUnit XML parser  |
 |   AST import graph |         | - forust-ml GBDT      |         | - Bounded tracebacks|
@@ -293,7 +316,7 @@ Point your MCP client (Claude Desktop, Cursor, Claude Code, Antigravity) at `pts
           +----------------------+         |         +----------------------+
                                  v         v         v
                     +--------------------+   +--------------------+
-                    |     pts-store      |   |      pts-eval      |
+                    |   failcast-store   |   |   failcast-eval    |
                     | - Bundled SQLite   |   | - Walk-forward     |
                     | - WAL + migrations |   | - Random/AST/EWMA  |
                     | - As-of snapshots  |   |   baselines        |
@@ -302,7 +325,7 @@ Point your MCP client (Claude Desktop, Cursor, Claude Code, Antigravity) at `pts
                                +-----------+------------+
                                            v
                               +-------------------------+
-                              |        pts-core         |
+                              |      failcast-core      |
                               | Pure types, Config,     |
                               | TestRunner trait, Error |
                               +-------------------------+

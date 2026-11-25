@@ -1,0 +1,17 @@
+[package]
+name = "failcast-collectors"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Git diff/history mining and Tree-sitter Python AST import graph collector for failcast"
+keywords = ["git", "tree-sitter", "python", "testing", "failcast"]
+categories = ["development-tools::testing", "parsing"]
+
+[dependencies]
+failcast-core = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-python = { workspace = true }

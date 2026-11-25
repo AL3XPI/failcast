@@ -1,0 +1,17 @@
+[package]
+name = "failcast-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Bundled SQLite history store and point-in-time snapshot queries for failcast"
+keywords = ["testing", "sqlite", "predictive-testing", "ci", "failcast"]
+categories = ["development-tools::testing", "database"]
+
+[dependencies]
+failcast-core = { workspace = true }
+rusqlite = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

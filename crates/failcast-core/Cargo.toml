@@ -1,0 +1,19 @@
+[package]
+name = "failcast-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Core domain types, configuration, and traits for failcast predictive test selection"
+keywords = ["testing", "pytest", "predictive-testing", "ci", "failcast"]
+categories = ["development-tools::testing"]
+
+[dependencies]
+serde = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

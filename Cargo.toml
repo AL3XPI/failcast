@@ -1,19 +1,21 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/pts-core",
-    "crates/pts-store",
-    "crates/pts-collectors",
-    "crates/pts-ml",
-    "crates/pts-runners",
-    "crates/pts-eval",
-    "crates/pts-cli",
+    "crates/failcast-core",
+    "crates/failcast-store",
+    "crates/failcast-collectors",
+    "crates/failcast-ml",
+    "crates/failcast-runners",
+    "crates/failcast-eval",
+    "crates/failcast-cli",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+repository = "https://github.com/AL3XPI/failcast"
+homepage = "https://github.com/AL3XPI/failcast"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -38,9 +40,9 @@ tree-sitter = "0.25"
 tree-sitter-python = "0.23"
 uuid = { version = "1", features = ["v4"] }
 
-pts-core = { path = "crates/pts-core" }
-pts-store = { path = "crates/pts-store" }
-pts-collectors = { path = "crates/pts-collectors" }
-pts-ml = { path = "crates/pts-ml" }
-pts-runners = { path = "crates/pts-runners" }
-pts-eval = { path = "crates/pts-eval" }
+failcast-core = { version = "0.1.0", path = "crates/failcast-core" }
+failcast-store = { version = "0.1.0", path = "crates/failcast-store" }
+failcast-collectors = { version = "0.1.0", path = "crates/failcast-collectors" }
+failcast-ml = { version = "0.1.0", path = "crates/failcast-ml" }
+failcast-runners = { version = "0.1.0", path = "crates/failcast-runners" }
+failcast-eval = { version = "0.1.0", path = "crates/failcast-eval" }

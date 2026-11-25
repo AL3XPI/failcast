@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Reproducible systems latency and binary footprint benchmark for `pts`.
+"""Reproducible systems latency and binary footprint benchmark for `failcast`.
 
-Builds `target/release/pts` and `pts-ml`'s `bench_infer` example, then measures:
+Builds `target/release/failcast` and `failcast-ml`'s `bench_infer` example, then measures:
   - Stripped release binary size (MB)
-  - Median and p95 cold-start latency (15 runs) of `pts run --budget 15 --dry-run --json`
-  - Median and p95 latency (15 runs) of `pts explain <test_id> --json`
-  - Pure `pts-ml` GBDT+Platt scoring throughput (ms per 1,000 tests and tests/sec)
+  - Median and p95 cold-start latency (15 runs) of `failcast run --budget 15 --dry-run --json`
+  - Median and p95 latency (15 runs) of `failcast explain <test_id> --json`
+  - Pure `failcast-ml` GBDT+Platt scoring throughput (ms per 1,000 tests and tests/sec)
 """
 
 from __future__ import annotations
@@ -13,7 +13,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import platform
 import shutil
 import subprocess
@@ -101,7 +100,7 @@ def measure_command_latencies(
 
 def measure_stripped_binary_mb(binary_path: Path) -> tuple[float, float]:
     raw_bytes = binary_path.stat().st_size
-    with tempfile.TemporaryDirectory(prefix="pts-strip-") as tmpdir:
+    with tempfile.TemporaryDirectory(prefix="failcast-strip-") as tmpdir:
         copied = Path(tmpdir) / binary_path.name
         shutil.copy2(binary_path, copied)
         strip_bin = shutil.which("strip")
@@ -111,9 +110,9 @@ def measure_stripped_binary_mb(binary_path: Path) -> tuple[float, float]:
     return raw_bytes / (1024 * 1024), stripped_bytes / (1024 * 1024)
 
 
-def create_offline_fixture_repo(pts_bin: Path, num_tests: int = 1000) -> Path:
-    """Create a 1,000-test Python git repository with trained PTS model for offline benchmarking."""
-    repo_dir = Path(tempfile.mkdtemp(prefix="pts-bench-fixture-"))
+def create_offline_fixture_repo(failcast_bin: Path, num_tests: int = 1000) -> Path:
+    """Create a 1,000-test Python git repository with trained failcast model for offline benchmarking."""
+    repo_dir = Path(tempfile.mkdtemp(prefix="failcast-bench-fixture-"))
     src_dir = repo_dir / "src"
     tests_dir = repo_dir / "tests"
     src_dir.mkdir(parents=True)
@@ -135,17 +134,17 @@ def create_offline_fixture_repo(pts_bin: Path, num_tests: int = 1000) -> Path:
         (tests_dir / f"test_mod_{m}.py").write_text("".join(lines), encoding="utf-8")
 
     (src_dir / "__init__.py").write_text("", encoding="utf-8")
-    (repo_dir / ".gitignore").write_text(".pts/\n__pycache__/\n", encoding="utf-8")
+    (repo_dir / ".gitignore").write_text(".failcast/\n__pycache__/\n", encoding="utf-8")
 
     run_cmd(["git", "init", "-q"], cwd=repo_dir)
-    run_cmd(["git", "config", "user.name", "PTS Bench"], cwd=repo_dir)
+    run_cmd(["git", "config", "user.name", "Failcast Bench"], cwd=repo_dir)
     run_cmd(["git", "config", "user.email", "bench@example.com"], cwd=repo_dir)
     run_cmd(["git", "add", "."], cwd=repo_dir)
     run_cmd(["git", "commit", "-q", "-m", "Initial 1000-test fixture"], cwd=repo_dir)
 
-    run_cmd([str(pts_bin), "init", "--history-limit", "50"], cwd=repo_dir)
+    run_cmd([str(failcast_bin), "init", "--history-limit", "50"], cwd=repo_dir)
 
-    jsonl_path = repo_dir / ".pts" / "fixture_runs.jsonl"
+    jsonl_path = repo_dir / ".failcast" / "fixture_runs.jsonl"
     base_ts = 1_720_000_000
     with jsonl_path.open("w", encoding="utf-8") as fh:
         for r in range(40):
@@ -174,9 +173,9 @@ def create_offline_fixture_repo(pts_bin: Path, num_tests: int = 1000) -> Path:
             }
             fh.write(json.dumps(rec) + "\n")
 
-    run_cmd([str(pts_bin), "import-runs", str(jsonl_path)], cwd=repo_dir)
+    run_cmd([str(failcast_bin), "import-runs", str(jsonl_path)], cwd=repo_dir)
     jsonl_path.unlink(missing_ok=True)
-    run_cmd([str(pts_bin), "train"], cwd=repo_dir)
+    run_cmd([str(failcast_bin), "train"], cwd=repo_dir)
 
     # Touch one source file so dry-run & explain evaluate a non-empty working-tree diff.
     with (src_dir / "mod_0.py").open("a", encoding="utf-8") as fh:
@@ -230,23 +229,25 @@ def render_markdown_table(summary: dict[str, Any]) -> str:
         "",
         "| Metric | Value | Notes |",
         "| :--- | ---: | :--- |",
-        f"| Stripped release binary size (`pts`) | **{summary['stripped_binary_mb']:.2f} MB** | Unstripped: {summary['raw_binary_mb']:.2f} MB (single static SQLite + GBDT + Tree-sitter + MCP binary) |",
-        f"| Warm CLI `pts run --budget 15 --dry-run --json` (p50 / p95) | **{summary['warm_dry_run_p50_ms']:.1f} ms / {summary['warm_dry_run_p95_ms']:.1f} ms** | Pure Rust cached discovery ({speedup:.1f}x faster than cold; git diff + SQLite + AST + GBDT+Platt) |",
-        f"| Warm CLI `pts explain <test_id> --json` (p50 / p95) | **{summary['warm_explain_p50_ms']:.1f} ms / {summary['warm_explain_p95_ms']:.1f} ms** | Pure Rust cached discovery over {summary['runs']} runs (16 features + signals + Platt probability) |",
-        f"| Cold CLI `pts run --budget 15 --dry-run --refresh-tests --json` (p50 / p95) | **{summary['cold_dry_run_p50_ms']:.1f} ms / {summary['cold_dry_run_p95_ms']:.1f} ms** | Includes external Python + `pytest --collect-only` startup across {summary['discovered_tests']:,} tests |",
-        f"| Cold CLI `pts explain <test_id> --refresh-tests --json` (p50 / p95) | **{summary['cold_explain_p50_ms']:.1f} ms / {summary['cold_explain_p95_ms']:.1f} ms** | Includes external Python + `pytest --collect-only` startup |",
-        f"| Pure `pts-ml` scoring latency (1,000 tests, p50 / p95) | **{summary['ml_infer_p50_ms_per_1000']:.2f} ms / {summary['ml_infer_p95_ms_per_1000']:.2f} ms** | **{summary['ml_infer_tests_per_sec']:,.0f} tests/sec** (150-tree GBDT + Platt calibration) |",
+        f"| Stripped release binary size (`failcast`) | **{summary['stripped_binary_mb']:.2f} MB** | Unstripped: {summary['raw_binary_mb']:.2f} MB (single static SQLite + GBDT + Tree-sitter + MCP binary) |",
+        f"| Warm CLI `failcast run --budget 15 --dry-run --json` (p50 / p95) | **{summary['warm_dry_run_p50_ms']:.1f} ms / {summary['warm_dry_run_p95_ms']:.1f} ms** | Pure Rust cached discovery ({speedup:.1f}x faster than cold; git diff + SQLite + AST + GBDT+Platt) |",
+        f"| Warm CLI `failcast explain <test_id> --json` (p50 / p95) | **{summary['warm_explain_p50_ms']:.1f} ms / {summary['warm_explain_p95_ms']:.1f} ms** | Pure Rust cached discovery over {summary['runs']} runs (16 features + signals + Platt probability) |",
+        f"| Cold CLI `failcast run --budget 15 --dry-run --refresh-tests --json` (p50 / p95) | **{summary['cold_dry_run_p50_ms']:.1f} ms / {summary['cold_dry_run_p95_ms']:.1f} ms** | Includes external Python + `pytest --collect-only` startup across {summary['discovered_tests']:,} tests |",
+        f"| Cold CLI `failcast explain <test_id> --refresh-tests --json` (p50 / p95) | **{summary['cold_explain_p50_ms']:.1f} ms / {summary['cold_explain_p95_ms']:.1f} ms** | Includes external Python + `pytest --collect-only` startup |",
+        f"| Pure `failcast-ml` scoring latency (1,000 tests, p50 / p95) | **{summary['ml_infer_p50_ms_per_1000']:.2f} ms / {summary['ml_infer_p95_ms_per_1000']:.2f} ms** | **{summary['ml_infer_tests_per_sec']:,.0f} tests/sec** (150-tree GBDT + Platt calibration) |",
     ]
     return "\n".join(lines)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run reproducible systems latency benchmarks for pts.")
+    parser = argparse.ArgumentParser(
+        description="Run reproducible systems latency benchmarks for failcast."
+    )
     parser.add_argument(
         "--repo-dir",
         type=Path,
         default=None,
-        help="Path to an initialized Python repo (with .pts/store.db). If omitted, creates a 1,000-test offline fixture.",
+        help="Path to an initialized Python repo (with .failcast/store.db). If omitted, creates a 1,000-test offline fixture.",
     )
     parser.add_argument(
         "--runs",
@@ -257,7 +258,7 @@ def main() -> int:
     parser.add_argument(
         "--test-id",
         default=None,
-        help="Specific test_id for `pts explain` benchmark (auto-detected if omitted).",
+        help="Specific test_id for `failcast explain` benchmark (auto-detected if omitted).",
     )
     parser.add_argument(
         "--out-json",
@@ -268,23 +269,27 @@ def main() -> int:
     args = parser.parse_args()
 
     workspace_root = Path(__file__).resolve().parent.parent
-    print("[bench] Building release `pts` binary and `pts-ml` inference benchmark...", file=sys.stderr)
-    run_cmd(["cargo", "build", "--release", "--bin", "pts"], cwd=workspace_root)
+    exe = ".exe" if platform.system() == "Windows" else ""
+    print(
+        "[bench] Building release `failcast` binary and `failcast-ml` inference benchmark...",
+        file=sys.stderr,
+    )
+    run_cmd(["cargo", "build", "--release", "--bin", "failcast"], cwd=workspace_root)
     run_cmd(
-        ["cargo", "build", "--release", "--example", "bench_infer", "-p", "pts-ml"],
+        ["cargo", "build", "--release", "--example", "bench_infer", "-p", "failcast-ml"],
         cwd=workspace_root,
     )
 
-    pts_bin = workspace_root / "target" / "release" / "pts"
-    infer_bin = workspace_root / "target" / "release" / "examples" / "bench_infer"
+    failcast_bin = workspace_root / "target" / "release" / f"failcast{exe}"
+    infer_bin = workspace_root / "target" / "release" / "examples" / f"bench_infer{exe}"
 
-    raw_mb, stripped_mb = measure_stripped_binary_mb(pts_bin)
+    raw_mb, stripped_mb = measure_stripped_binary_mb(failcast_bin)
     print(f"[bench] Binary size: stripped={stripped_mb:.2f} MB (raw={raw_mb:.2f} MB)", file=sys.stderr)
 
     infer_proc = run_cmd([str(infer_bin)], cwd=workspace_root)
     infer_data = json.loads(infer_proc.stdout.strip())
     print(
-        f"[bench] pts-ml inference: {infer_data['median_ms_per_1000']:.3f} ms / 1,000 tests "
+        f"[bench] failcast-ml inference: {infer_data['median_ms_per_1000']:.3f} ms / 1,000 tests "
         f"({infer_data['tests_per_sec']:,.0f} tests/sec)",
         file=sys.stderr,
     )
@@ -293,11 +298,11 @@ def main() -> int:
     touched_file: Optional[Path] = None
     original_content: Optional[bytes] = None
 
-    if args.repo_dir is not None and (args.repo_dir / ".pts" / "store.db").is_file():
+    if args.repo_dir is not None and (args.repo_dir / ".failcast" / "store.db").is_file():
         repo_dir = args.repo_dir.resolve()
         target_label = detect_repo_label(repo_dir)
-        if not (repo_dir / ".pts" / "model.json").is_file():
-            run_cmd([str(pts_bin), "train"], cwd=repo_dir, check=False)
+        if not (repo_dir / ".failcast" / "model.json").is_file():
+            run_cmd([str(failcast_bin), "train"], cwd=repo_dir, check=False)
         # Ensure working tree has a small diff during measurement, then restore cleanly.
         diff_check = run_cmd(["git", "status", "--porcelain"], cwd=repo_dir, check=False)
         if not diff_check.stdout.strip():
@@ -305,17 +310,19 @@ def main() -> int:
             if candidate is not None:
                 original_content = candidate.read_bytes()
                 touched_file = candidate
-                candidate.write_bytes(original_content + b"\n# pts systems benchmark temporary edit\n")
+                candidate.write_bytes(
+                    original_content + b"\n# failcast systems benchmark temporary edit\n"
+                )
     else:
         print("[bench] Creating 1,000-test offline Python fixture repository...", file=sys.stderr)
-        repo_dir = create_offline_fixture_repo(pts_bin, num_tests=1000)
+        repo_dir = create_offline_fixture_repo(failcast_bin, num_tests=1000)
         created_temp_repo = True
         target_label = "synthetic-1000-tests-fixture"
 
     try:
         print("[bench] Priming SQLite discovery cache...", file=sys.stderr)
         prime = run_cmd(
-            [str(pts_bin), "run", "--budget", "15", "--dry-run", "--json", "--refresh-tests"],
+            [str(failcast_bin), "run", "--budget", "15", "--dry-run", "--json", "--refresh-tests"],
             cwd=repo_dir,
         )
         dry_run_report = json.loads(prime.stdout)
@@ -329,43 +336,43 @@ def main() -> int:
                 raise RuntimeError("No selected tests returned by dry-run; pass --test-id explicitly.")
 
         print(
-            f"[bench] Measuring WARM `pts run --budget 15 --dry-run --json` ({args.runs} runs, cached discovery)...",
+            f"[bench] Measuring WARM `failcast run --budget 15 --dry-run --json` ({args.runs} runs, cached discovery)...",
             file=sys.stderr,
         )
         warm_dry_run_ms, dry_run_stdout = measure_command_latencies(
-            [str(pts_bin), "run", "--budget", "15", "--dry-run", "--json"],
+            [str(failcast_bin), "run", "--budget", "15", "--dry-run", "--json"],
             cwd=repo_dir,
             runs=args.runs,
         )
         dry_run_report = json.loads(dry_run_stdout)
 
         print(
-            f"[bench] Measuring WARM `pts explain {test_id} --json` ({args.runs} runs, cached discovery)...",
+            f"[bench] Measuring WARM `failcast explain {test_id} --json` ({args.runs} runs, cached discovery)...",
             file=sys.stderr,
         )
         warm_explain_ms, _ = measure_command_latencies(
-            [str(pts_bin), "explain", test_id, "--json"],
+            [str(failcast_bin), "explain", test_id, "--json"],
             cwd=repo_dir,
             runs=args.runs,
         )
 
         print(
-            f"[bench] Measuring COLD `pts run --budget 15 --dry-run --refresh-tests --json` ({args.runs} runs)...",
+            f"[bench] Measuring COLD `failcast run --budget 15 --dry-run --refresh-tests --json` ({args.runs} runs)...",
             file=sys.stderr,
         )
         cold_dry_run_ms, _ = measure_command_latencies(
-            [str(pts_bin), "run", "--budget", "15", "--dry-run", "--json", "--refresh-tests"],
+            [str(failcast_bin), "run", "--budget", "15", "--dry-run", "--json", "--refresh-tests"],
             cwd=repo_dir,
             runs=args.runs,
             warmup=1,
         )
 
         print(
-            f"[bench] Measuring COLD `pts explain {test_id} --refresh-tests --json` ({args.runs} runs)...",
+            f"[bench] Measuring COLD `failcast explain {test_id} --refresh-tests --json` ({args.runs} runs)...",
             file=sys.stderr,
         )
         cold_explain_ms, _ = measure_command_latencies(
-            [str(pts_bin), "explain", test_id, "--json", "--refresh-tests"],
+            [str(failcast_bin), "explain", test_id, "--json", "--refresh-tests"],
             cwd=repo_dir,
             runs=args.runs,
             warmup=1,

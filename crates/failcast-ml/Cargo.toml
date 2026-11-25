@@ -1,0 +1,20 @@
+[package]
+name = "failcast-ml"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Feature extraction, GBDT training, Platt calibration, and cost-aware test selector for failcast"
+keywords = ["gbdt", "machine-learning", "testing", "calibration", "failcast"]
+categories = ["development-tools::testing", "algorithms"]
+
+[dependencies]
+forust-ml = { workspace = true }
+failcast-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+failcast-store = { workspace = true }
+tempfile = { workspace = true }

@@ -18,7 +18,7 @@ def test_add_negative():
 
 
 def test_divide_broken():
-    if os.environ.get("PTS_FIXTURE_FAIL") == "1":
+    if os.environ.get("FAILCAST_FIXTURE_FAIL") == "1":
         assert divide(10, 2) == 999
     assert divide(10, 2) == 5.0
 
