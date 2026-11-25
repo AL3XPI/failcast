@@ -141,7 +141,13 @@ impl FailcastMcpServer {
     /// Dry-run test selection for the current working-tree git diff (does not execute tests).
     #[tool(
         name = "select_tests",
-        description = "Dry-run predictive test selection for the current working-tree git diff without executing tests."
+        description = "Dry-run predictive test selection for the current working-tree git diff without executing tests.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     pub async fn select_tests(
         &self,
@@ -206,7 +212,13 @@ impl FailcastMcpServer {
     /// to `.failcast/store.db`, and returns structured outcomes with bounded tracebacks.
     #[tool(
         name = "run_fast_tests",
-        description = "Select and execute the highest-value tests for the current working-tree diff, persist outcomes to .failcast/store.db, and return structured pass/fail results."
+        description = "Select and execute the highest-value tests for the current working-tree diff, persist outcomes to .failcast/store.db, and return structured pass/fail results.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     pub async fn run_fast_tests(
         &self,
@@ -249,7 +261,13 @@ impl FailcastMcpServer {
     /// Inspects the exact 16 features and score behind a test's ranking for the current diff.
     #[tool(
         name = "explain_selection",
-        description = "Explain a specific test's ranking by returning all 16 extracted features, active model mode, failure probability, yield score, and top contributing signals."
+        description = "Explain a specific test's ranking by returning all 16 extracted features, active model mode, failure probability, yield score, and top contributing signals.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     pub async fn explain_selection(
         &self,

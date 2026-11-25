@@ -1,0 +1,28 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.AL3XPI/failcast",
+  "title": "Failcast",
+  "description": "Local Rust CLI and MCP server that predicts which pytest tests will fail for a git diff",
+  "version": "0.1.1",
+  "repository": {
+    "url": "https://github.com/AL3XPI/failcast",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "failcast",
+      "version": "0.1.1",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "mcp"
+        }
+      ]
+    }
+  ]
+}

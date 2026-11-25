@@ -1,8 +1,9 @@
 # failcast
 
 [![CI](https://github.com/AL3XPI/failcast/actions/workflows/ci.yml/badge.svg)](https://github.com/AL3XPI/failcast/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/failcast)](https://pypi.org/project/failcast/)
+[![crates.io](https://img.shields.io/crates/v/failcast)](https://crates.io/crates/failcast)
 [![Release](https://img.shields.io/github/v/release/AL3XPI/failcast?include_prereleases)](https://github.com/AL3XPI/failcast/releases)
-![Rust](https://img.shields.io/badge/Rust-2024%20%7C%20rustc%201.98.1-dea584?logo=rust&logoColor=white)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 `failcast` is a local Rust CLI and stdio MCP server that reads your working-tree `git diff`, predicts which `pytest` tests are likely to fail, runs the highest-yield ones inside a time or count budget, and stores every outcome in SQLite so future runs get sharper. Everything compiles into one Rust binary (Edition 2024) backed by statically linked bundled `rusqlite`, pure-Rust `forust-ml` gradient-boosted trees with Platt calibration, and a `tree-sitter` file-level Python import graph.
@@ -11,30 +12,37 @@ The selector ranks candidate tests by calibrated failure probability per millise
 
 ## Install & Quickstart
 
-Download a prebuilt binary for macOS (`aarch64-apple-darwin`), Linux (`x86_64-unknown-linux-gnu`), or Windows (`x86_64-pc-windows-msvc`) from [GitHub Releases](https://github.com/AL3XPI/failcast/releases) (verify with `SHA256SUMS.txt` if desired):
+Run or install the prebuilt binary directly from PyPI with `uvx` or `pipx` (no Rust toolchain needed):
+
+```bash
+# Zero-install run via uvx
+uvx failcast --help
+
+# Or install globally via pipx
+pipx install failcast
+```
+
+If you have a Rust toolchain (1.88+, Edition 2024), you can also install from crates.io:
+
+```bash
+cargo install failcast
+```
+
+Prebuilt release archives for macOS (`aarch64-apple-darwin`), Linux (`x86_64-unknown-linux-gnu`), and Windows (`x86_64-pc-windows-msvc`) are available on [GitHub Releases](https://github.com/AL3XPI/failcast/releases) with `SHA256SUMS.txt`:
 
 ```bash
 # macOS (Apple Silicon)
-curl -fsSL https://github.com/AL3XPI/failcast/releases/latest/download/failcast-v0.1.0-aarch64-apple-darwin.tar.gz \
+curl -fsSL https://github.com/AL3XPI/failcast/releases/latest/download/failcast-v0.1.1-aarch64-apple-darwin.tar.gz \
   | tar -xz -C ~/.local/bin
 
 # Linux (x86_64)
-curl -fsSL https://github.com/AL3XPI/failcast/releases/latest/download/failcast-v0.1.0-x86_64-unknown-linux-gnu.tar.gz \
+curl -fsSL https://github.com/AL3XPI/failcast/releases/latest/download/failcast-v0.1.1-x86_64-unknown-linux-gnu.tar.gz \
   | tar -xz -C ~/.local/bin
 
 # Windows (PowerShell)
-Invoke-WebRequest https://github.com/AL3XPI/failcast/releases/latest/download/failcast-v0.1.0-x86_64-pc-windows-msvc.zip -OutFile failcast.zip
+Invoke-WebRequest https://github.com/AL3XPI/failcast/releases/latest/download/failcast-v0.1.1-x86_64-pc-windows-msvc.zip -OutFile failcast.zip
 Expand-Archive failcast.zip -DestinationPath "$env:USERPROFILE\.local\bin" -Force
 ```
-
-You can also build from source with Rust 1.88+ (Edition 2024, tested on `rustc 1.98.1`):
-
-```bash
-git clone https://github.com/AL3XPI/failcast.git
-cargo install --path failcast/crates/failcast-cli
-```
-
-Once registry publishing is enabled for `failcast`, `cargo install failcast` (crates.io) and `uvx failcast` / `pipx install failcast` (PyPI binary wheels via `maturin`) will also work directly without building locally.
 
 Running tests requires `pytest` on your `PATH` (or configured in `.failcast.toml`). Add `.failcast/` to your repository's `.gitignore`, initialize the local SQLite store, and seed a baseline run:
 
@@ -74,7 +82,7 @@ When tests fail, `failcast run` still parses the JUnit XML and commits every out
 <details>
 <summary>Configuration &amp; history import (.failcast.toml, backfill, JSONL)</summary>
 
-Every key in `.failcast.toml` is optional. Copy `.failcast.toml.example` to `.failcast.toml` at your repository root to override any default:
+Every key in `.failcast.toml` is optional. Create `.failcast.toml` at your repository root to override any default:
 
 ```toml
 runner = "pytest"
@@ -267,7 +275,7 @@ python3 scripts/bench_systems.py --repo-dir ../PyGithub --runs 15 --out-json doc
 | `run_fast_tests` | Select and execute tests within a budget or top-k limit, persist outcomes to `.failcast/store.db`, and return structured pass/fail counts with bounded tracebacks (`budget_seconds`, `top_k`, `run_all`, `refresh_tests`). |
 | `explain_selection` | Return all 16 features, active model mode, calibrated failure probability, yield score, and top contributing signals for a specific `test_id` (`test_id`, `refresh_tests`). |
 
-Point your MCP client (Claude Desktop, Cursor, Claude Code, Antigravity) at `failcast mcp` with `cwd` set to the Python repo you are working in:
+Point your MCP client (Claude Desktop, Cursor, Claude Code, Antigravity) at `failcast mcp` with `cwd` set to the Python repo you are working in, either using the installed binary or via `uvx`:
 
 ```json
 {
@@ -275,6 +283,18 @@ Point your MCP client (Claude Desktop, Cursor, Claude Code, Antigravity) at `fai
     "failcast": {
       "command": "failcast",
       "args": ["mcp"],
+      "cwd": "/path/to/your/python-repo"
+    }
+  }
+}
+```
+
+```json
+{
+  "mcpServers": {
+    "failcast": {
+      "command": "uvx",
+      "args": ["failcast", "mcp"],
       "cwd": "/path/to/your/python-repo"
     }
   }
@@ -345,3 +365,5 @@ python3 -m unittest scripts/test_collect_gha_pytest.py
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+<!-- mcp-name: io.github.AL3XPI/failcast -->

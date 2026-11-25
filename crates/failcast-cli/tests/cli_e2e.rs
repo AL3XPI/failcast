@@ -754,9 +754,25 @@ mod tests {
             init_resp.get("error").is_none(),
             "initialize failed: {init_resp}"
         );
+        let caps = init_resp["result"]["capabilities"]
+            .as_object()
+            .expect("server capabilities must be an object");
         assert!(
-            init_resp["result"]["capabilities"]["tools"].is_object(),
+            caps.get("tools").is_some_and(|v| v.is_object()),
             "server must advertise tools capability: {init_resp}"
+        );
+        assert!(
+            caps.get("resources").is_none(),
+            "server must not advertise resources capability: {init_resp}"
+        );
+        assert!(
+            caps.get("prompts").is_none(),
+            "server must not advertise prompts capability: {init_resp}"
+        );
+        assert_eq!(init_resp["result"]["serverInfo"]["name"], "failcast");
+        assert_eq!(
+            init_resp["result"]["serverInfo"]["version"],
+            env!("CARGO_PKG_VERSION")
         );
 
         send_msg(
@@ -783,7 +799,12 @@ mod tests {
             .expect("tools/list must return tools array");
         assert_eq!(tools.len(), 3, "expected exactly 3 MCP tools");
 
-        for expected_name in ["select_tests", "run_fast_tests", "explain_selection"] {
+        let expected_tools = [
+            ("select_tests", true, false, true, false),
+            ("run_fast_tests", false, false, false, false),
+            ("explain_selection", true, false, true, false),
+        ];
+        for (expected_name, read_only, destructive, idempotent, open_world) in expected_tools {
             let tool = tools
                 .iter()
                 .find(|t| t["name"] == expected_name)
@@ -795,6 +816,29 @@ mod tests {
             assert!(
                 tool["outputSchema"].is_object(),
                 "tool `{expected_name}` must expose valid outputSchema"
+            );
+            let annotations = tool["annotations"].as_object().unwrap_or_else(|| {
+                panic!("tool `{expected_name}` must expose annotations: {tool}")
+            });
+            assert_eq!(
+                annotations.get("readOnlyHint").and_then(|v| v.as_bool()),
+                Some(read_only),
+                "unexpected readOnlyHint for `{expected_name}`: {tool}"
+            );
+            assert_eq!(
+                annotations.get("destructiveHint").and_then(|v| v.as_bool()),
+                Some(destructive),
+                "unexpected destructiveHint for `{expected_name}`: {tool}"
+            );
+            assert_eq!(
+                annotations.get("idempotentHint").and_then(|v| v.as_bool()),
+                Some(idempotent),
+                "unexpected idempotentHint for `{expected_name}`: {tool}"
+            );
+            assert_eq!(
+                annotations.get("openWorldHint").and_then(|v| v.as_bool()),
+                Some(open_world),
+                "unexpected openWorldHint for `{expected_name}`: {tool}"
             );
         }
 
