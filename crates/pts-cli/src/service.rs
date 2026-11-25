@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -26,11 +27,13 @@ use pts_runners::{PytestRunner, normalize_posix_path};
 use pts_store::{RunRecord, Store, TestOutcomeRecord};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tracing::warn;
 use uuid::Uuid;
 
 pub const DEFAULT_UNSEEN_STALENESS_DAYS: f64 = 30.0;
 pub const MODEL_ARTIFACT_REL_PATH: &str = ".pts/model.json";
+pub const DISCOVERY_FINGERPRINT_META_KEY: &str = "discovery_fingerprint";
 
 /// Selection strategy requested by CLI commands or MCP tools.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -211,10 +214,12 @@ pub struct ExplainReport {
     pub top_signals: Vec<ContributingSignal>,
 }
 
-/// Selects tests for the current working-tree diff without executing them or modifying `.pts/store.db`.
+/// Selects tests for the current working-tree diff without executing them or writing runs/outcomes
+/// to `.pts/store.db` (discovery metadata cache may be refreshed on fingerprint mismatch).
 pub fn select_for_working_tree(
     repo_root: &Path,
     request: SelectionRequest,
+    refresh_tests: bool,
 ) -> Result<SelectionPlan> {
     if let SelectionRequest::TargetRecall { target_recall, .. } = request
         && (!target_recall.is_finite() || target_recall <= 0.0 || target_recall >= 1.0)
@@ -226,8 +231,7 @@ pub fn select_for_working_tree(
     let db_path = repo_root.join(".pts").join("store.db");
     let diff = load_working_diff(repo_root)?;
 
-    let runner = PytestRunner::from_config(&config);
-    let discovered = runner.discover(repo_root)?;
+    let discovered = discover_tests_cached(repo_root, &config, &db_path, refresh_tests)?;
     let now_ts = current_unix_ts();
 
     let (mode, mode_label, model_mode, budget_ms, selected_plan): (
@@ -239,12 +243,12 @@ pub fn select_for_working_tree(
     ) = if matches!(request, SelectionRequest::All) {
         (RunMode::All, "all", "full", None, None)
     } else {
-        let history = load_history_or_default(&db_path, now_ts)?;
+        let modified_paths: Vec<&str> = diff.files.iter().map(|f| f.path.as_str()).collect();
+        let history = load_history_or_default(&db_path, now_ts, &modified_paths)?;
         let loaded_model = try_load_model(repo_root);
         let use_gbdt = !should_use_heuristic(&history, &config, loaded_model.is_some());
 
         let graph = PythonImportGraphBuilder::new().build(repo_root)?;
-        let modified_paths: Vec<&str> = diff.files.iter().map(|f| f.path.as_str()).collect();
 
         let feature_rows: Vec<[f64; NUM_FEATURES]> = discovered
             .iter()
@@ -356,13 +360,14 @@ pub fn select_for_working_tree(
 pub fn run_selected_tests(
     repo_root: &Path,
     request: SelectionRequest,
+    refresh_tests: bool,
 ) -> Result<RunExecutionReport> {
     let db_path = repo_root.join(".pts").join("store.db");
     if !db_path.is_file() {
         return Err(PtsError::NotInitialized.into());
     }
 
-    let plan = select_for_working_tree(repo_root, request)?;
+    let plan = select_for_working_tree(repo_root, request, refresh_tests)?;
     let runner = PytestRunner::from_config(&plan.config);
 
     let mut store = Store::open(&db_path)?;
@@ -509,10 +514,10 @@ pub fn run_selected_tests(
 /// Extracts all 16 features for `test_id` against the current working-tree diff,
 /// scores it with the active model (GBDT+Platt or cold-start heuristic), and returns
 /// the full breakdown and top contributing signals.
-pub fn explain_test(repo_root: &Path, test_id: &str) -> Result<ExplainReport> {
+pub fn explain_test(repo_root: &Path, test_id: &str, refresh_tests: bool) -> Result<ExplainReport> {
     let config = Config::load(repo_root)?;
-    let runner = PytestRunner::from_config(&config);
-    let discovered = runner.discover(repo_root)?;
+    let db_path = repo_root.join(".pts").join("store.db");
+    let discovered = discover_tests_cached(repo_root, &config, &db_path, refresh_tests)?;
 
     let normalized_query = normalize_test_id(test_id);
     let Some(test_case) = discovered
@@ -527,13 +532,12 @@ pub fn explain_test(repo_root: &Path, test_id: &str) -> Result<ExplainReport> {
 
     let diff = load_working_diff(repo_root)?;
     let now_ts = current_unix_ts();
-    let db_path = repo_root.join(".pts").join("store.db");
-    let history = load_history_or_default(&db_path, now_ts)?;
+    let modified_paths: Vec<&str> = diff.files.iter().map(|f| f.path.as_str()).collect();
+    let history = load_history_or_default(&db_path, now_ts, &modified_paths)?;
     let loaded_model = try_load_model(repo_root);
     let use_gbdt = !should_use_heuristic(&history, &config, loaded_model.is_some());
 
     let graph = PythonImportGraphBuilder::new().build(repo_root)?;
-    let modified_paths: Vec<&str> = diff.files.iter().map(|f| f.path.as_str()).collect();
     let ast_min_hop = graph.min_hop_to_any(&test_case.file_path, &modified_paths);
     let features = extract_features(test_case, &diff, &history, ast_min_hop);
 
@@ -660,6 +664,156 @@ pub fn normalize_diff_files(raw: Vec<DiffFile>) -> Vec<DiffFile> {
         .collect()
 }
 
+/// Computes a fast deterministic SHA-256 fingerprint over sorted repo-relative paths, byte lengths,
+/// and nanosecond modification timestamps of Python test and pytest configuration files.
+pub fn compute_discovery_fingerprint(repo_root: &Path) -> Result<String> {
+    let mut entries: Vec<(String, u64, u128)> = Vec::new();
+    collect_discovery_files(repo_root, repo_root, &mut entries)?;
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut hasher = Sha256::new();
+    for (rel_path, len, mtime_ns) in entries {
+        hasher.update(rel_path.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(len.to_le_bytes());
+        hasher.update(mtime_ns.to_le_bytes());
+        hasher.update(b"\n");
+    }
+
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    Ok(hex)
+}
+
+fn collect_discovery_files(
+    repo_root: &Path,
+    dir: &Path,
+    out: &mut Vec<(String, u64, u128)>,
+) -> Result<()> {
+    let read_dir = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to read directory {}", dir.display()));
+        }
+    };
+
+    for entry in read_dir {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let name_str = file_name.to_string_lossy();
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+
+        if file_type.is_symlink() {
+            continue;
+        }
+
+        if file_type.is_dir() {
+            if is_skipped_discovery_dir(&name_str) {
+                continue;
+            }
+            collect_discovery_files(repo_root, &path, out)?;
+            continue;
+        }
+
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let rel = path.strip_prefix(repo_root).unwrap_or(&path);
+        let rel_posix = normalize_posix_path(&rel.to_string_lossy());
+        if !is_discovery_relevant_file(&rel_posix, &name_str) {
+            continue;
+        }
+
+        let meta = entry.metadata()?;
+        let len = meta.len();
+        let mtime_ns = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        out.push((rel_posix, len, mtime_ns));
+    }
+
+    Ok(())
+}
+
+fn is_skipped_discovery_dir(name: &str) -> bool {
+    matches!(
+        name,
+        ".git"
+            | ".pts"
+            | "target"
+            | "node_modules"
+            | "__pycache__"
+            | ".pytest_cache"
+            | ".tox"
+            | ".mypy_cache"
+            | ".ruff_cache"
+            | ".venv"
+            | "venv"
+            | "env"
+            | "dist"
+            | "build"
+            | ".eggs"
+            | ".hg"
+            | ".svn"
+    ) || name.ends_with(".egg-info")
+}
+
+fn is_discovery_relevant_file(rel_posix: &str, file_name: &str) -> bool {
+    if matches!(
+        file_name,
+        "pyproject.toml" | "pytest.ini" | "setup.cfg" | "tox.ini" | "conftest.py"
+    ) {
+        return true;
+    }
+
+    if !file_name.ends_with(".py") {
+        return false;
+    }
+
+    file_name.starts_with("test_")
+        || file_name.ends_with("_test.py")
+        || rel_posix.starts_with("tests/")
+        || rel_posix.contains("/tests/")
+}
+
+fn discover_tests_cached(
+    repo_root: &Path,
+    config: &Config,
+    db_path: &Path,
+    refresh_tests: bool,
+) -> Result<Vec<TestCase>> {
+    let runner = PytestRunner::from_config(config);
+    if !db_path.is_file() {
+        return Ok(runner.discover(repo_root)?);
+    }
+
+    let fingerprint = compute_discovery_fingerprint(repo_root)?;
+    let mut store = Store::open(db_path)?;
+    store.migrate()?;
+
+    if !refresh_tests
+        && store.get_meta(DISCOVERY_FINGERPRINT_META_KEY)?.as_deref() == Some(fingerprint.as_str())
+    {
+        let cached = store.load_active_tests()?;
+        if !cached.is_empty() {
+            return Ok(cached);
+        }
+    }
+
+    let discovered = runner.discover(repo_root)?;
+    store.sync_discovered_tests(&discovered, &fingerprint, current_unix_ts())?;
+    Ok(discovered)
+}
+
 fn load_working_diff(repo_root: &Path) -> Result<DiffSummary> {
     if is_git_repo(repo_root) {
         extract_working_diff(repo_root).context("failed to extract working-tree git diff")
@@ -672,10 +826,14 @@ fn load_working_diff(repo_root: &Path) -> Result<DiffSummary> {
     }
 }
 
-fn load_history_or_default(db_path: &Path, now_ts: i64) -> Result<HistorySnapshot> {
+fn load_history_or_default(
+    db_path: &Path,
+    now_ts: i64,
+    diff_paths: &[&str],
+) -> Result<HistorySnapshot> {
     if db_path.is_file() {
         let store = Store::open(db_path)?;
-        Ok(store.load_history_snapshot(now_ts)?)
+        Ok(store.load_history_snapshot_for_diff(now_ts, diff_paths)?)
     } else {
         Ok(HistorySnapshot::default())
     }

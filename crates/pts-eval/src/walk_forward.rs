@@ -199,6 +199,14 @@ pub fn walk_forward_eval(
         .map(|_| std::array::from_fn(|_| MetricsAccumulator::default()))
         .collect();
 
+    // Offline walk-forward evaluation disables randomized anti-starvation exploration so
+    // every strategy is evaluated purely on ranking + cost-aware packing quality across budgets
+    // (live CLI/MCP execution retains `config.explore_fraction`).
+    let eval_selector_config = Config {
+        explore_fraction: 0.0,
+        ..config.selector_config.clone()
+    };
+
     let mut current_model: Option<TrainedModel> = None;
     let mut steps_since_train: usize = 0;
     let mut evaluated_runs = 0usize;
@@ -393,7 +401,7 @@ pub fn walk_forward_eval(
                         budget_ms,
                         &eval_run.diff_fingerprint,
                         snapshot.median_repo_test_ms,
-                        &config.selector_config,
+                        &eval_selector_config,
                         primary_reasons[s_idx],
                     );
 

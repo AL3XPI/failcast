@@ -10,7 +10,15 @@ use pts_core::{
 use rusqlite::{Connection, OptionalExtension, params};
 
 const SCHEMA_SQL: &str = include_str!("schema.sql");
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_V2_SQL: &str = "
+CREATE TABLE IF NOT EXISTS repo_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_run_diff_files_path ON run_diff_files(file_path);
+";
+const SCHEMA_VERSION_V1: i64 = 1;
+const SCHEMA_VERSION_V2: i64 = 2;
 const SECONDS_PER_30_DAYS: i64 = 30 * 86_400;
 const MAX_COCHANGE_FILES_PER_COMMIT: usize = 200;
 const EWMA_ALPHA_10: f64 = 0.2;
@@ -112,10 +120,112 @@ impl Store {
         self.conn
             .execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
-                params![SCHEMA_VERSION, applied_at],
+                params![SCHEMA_VERSION_V1, applied_at],
             )
             .map_err(store_err)?;
 
+        self.conn.execute_batch(SCHEMA_V2_SQL).map_err(store_err)?;
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![SCHEMA_VERSION_V2, applied_at],
+            )
+            .map_err(store_err)?;
+
+        Ok(())
+    }
+
+    pub fn get_meta(&self, key: &str) -> Result<Option<String>, PtsError> {
+        self.conn
+            .query_row(
+                "SELECT value FROM repo_meta WHERE key = ?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(store_err)
+    }
+
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<(), PtsError> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO repo_meta (key, value) VALUES (?1, ?2)",
+                params![key, value],
+            )
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    /// Loads all currently active discovered tests ordered canonically by `test_id`.
+    pub fn load_active_tests(&self) -> Result<Vec<TestCase>, PtsError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "
+                SELECT test_id, file_path
+                FROM tests
+                WHERE active = 1
+                ORDER BY test_id ASC
+                ",
+            )
+            .map_err(store_err)?;
+
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(TestCase {
+                    test_id: r.get(0)?,
+                    file_path: r.get(1)?,
+                })
+            })
+            .map_err(store_err)?;
+
+        let mut tests = Vec::new();
+        for row in rows {
+            tests.push(row.map_err(store_err)?);
+        }
+        Ok(tests)
+    }
+
+    /// Atomically synchronizes the active test inventory after fresh discovery:
+    /// marks disappeared tests `active = 0`, upserts currently discovered tests with `active = 1`,
+    /// and persists `repo_meta["discovery_fingerprint"]`.
+    pub fn sync_discovered_tests(
+        &mut self,
+        tests: &[TestCase],
+        fingerprint: &str,
+        seen_ts: i64,
+    ) -> Result<(), PtsError> {
+        let tx = self.conn.transaction().map_err(store_err)?;
+
+        tx.execute("UPDATE tests SET active = 0", [])
+            .map_err(store_err)?;
+
+        {
+            let mut stmt = tx
+                .prepare(
+                    "
+                    INSERT INTO tests (test_id, file_path, first_seen_ts, last_seen_ts, active)
+                    VALUES (?1, ?2, ?3, ?3, 1)
+                    ON CONFLICT(test_id) DO UPDATE SET
+                        file_path = excluded.file_path,
+                        last_seen_ts = MAX(tests.last_seen_ts, excluded.last_seen_ts),
+                        active = 1
+                    ",
+                )
+                .map_err(store_err)?;
+            for test in tests {
+                stmt.execute(params![test.test_id, test.file_path, seen_ts])
+                    .map_err(store_err)?;
+            }
+        }
+
+        tx.execute(
+            "INSERT OR REPLACE INTO repo_meta (key, value) VALUES ('discovery_fingerprint', ?1)",
+            params![fingerprint],
+        )
+        .map_err(store_err)?;
+
+        tx.commit().map_err(store_err)?;
         Ok(())
     }
 
@@ -657,6 +767,24 @@ impl Store {
     /// Read-only point-in-time history query strictly excluding any run or commit
     /// with timestamp `>= as_of_ts` (anti-leakage invariant).
     pub fn load_history_snapshot(&self, as_of_ts: i64) -> Result<HistorySnapshot, PtsError> {
+        self.load_history_snapshot_inner(as_of_ts, None)
+    }
+
+    /// Point-in-time history query scoped to co-failure statistics for `diff_paths`,
+    /// avoiding a full Cartesian join across untouched historical files during live CLI/MCP runs.
+    pub fn load_history_snapshot_for_diff(
+        &self,
+        as_of_ts: i64,
+        diff_paths: &[&str],
+    ) -> Result<HistorySnapshot, PtsError> {
+        self.load_history_snapshot_inner(as_of_ts, Some(diff_paths))
+    }
+
+    fn load_history_snapshot_inner(
+        &self,
+        as_of_ts: i64,
+        diff_paths: Option<&[&str]>,
+    ) -> Result<HistorySnapshot, PtsError> {
         let total_runs: i64 = self
             .conn
             .query_row(
@@ -798,44 +926,93 @@ impl Store {
         }
 
         // 2. Historical co-failure counts strictly prior to as_of_ts.
-        {
-            let mut stmt = self
-                .conn
-                .prepare(
-                    "
-                    SELECT o.test_id, d.file_path,
-                           COUNT(*) AS co_runs,
-                           SUM(CASE WHEN o.status IN ('fail', 'error') THEN 1 ELSE 0 END) AS co_fails
-                    FROM test_outcomes o
-                    JOIN runs r ON r.run_id = o.run_id
-                    JOIN run_diff_files d ON d.run_id = o.run_id
-                    WHERE r.started_at < ?1
-                      AND o.status != 'skip'
-                    GROUP BY o.test_id, d.file_path
-                    ",
-                )
-                .map_err(store_err)?;
+        match diff_paths {
+            Some([]) => {
+                // Empty working diff: no co-failure pairs will be queried by feature extraction.
+            }
+            Some(paths) => {
+                // Filter directly by modified diff paths using idx_run_diff_files_path so
+                // live CLI/MCP selection avoids scanning the full historical Cartesian join.
+                let mut stmt = self
+                    .conn
+                    .prepare(
+                        "
+                        SELECT o.test_id,
+                               COUNT(*) AS co_runs,
+                               SUM(CASE WHEN o.status IN ('fail', 'error') THEN 1 ELSE 0 END) AS co_fails
+                        FROM run_diff_files d
+                        JOIN runs r ON r.run_id = d.run_id
+                        JOIN test_outcomes o ON o.run_id = d.run_id
+                        WHERE d.file_path = ?1
+                          AND r.started_at < ?2
+                          AND o.status != 'skip'
+                        GROUP BY o.test_id
+                        ",
+                    )
+                    .map_err(store_err)?;
 
-            let rows = stmt
-                .query_map(params![as_of_ts], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, i64>(2)?,
-                        r.get::<_, i64>(3)?,
-                    ))
-                })
-                .map_err(store_err)?;
+                for &file_path in paths {
+                    let rows = stmt
+                        .query_map(params![file_path, as_of_ts], |r| {
+                            Ok((
+                                r.get::<_, String>(0)?,
+                                r.get::<_, i64>(1)?,
+                                r.get::<_, i64>(2)?,
+                            ))
+                        })
+                        .map_err(store_err)?;
 
-            for row in rows {
-                let (test_id, file_path, co_runs, co_fails) = row.map_err(store_err)?;
-                snapshot.cofail_counts.insert(
-                    (test_id, file_path),
-                    CoFailCounts {
-                        co_fails: co_fails.max(0) as u64,
-                        co_runs: co_runs.max(0) as u64,
-                    },
-                );
+                    for row in rows {
+                        let (test_id, co_runs, co_fails) = row.map_err(store_err)?;
+                        snapshot.cofail_counts.insert(
+                            (test_id, file_path.to_string()),
+                            CoFailCounts {
+                                co_fails: co_fails.max(0) as u64,
+                                co_runs: co_runs.max(0) as u64,
+                            },
+                        );
+                    }
+                }
+            }
+            None => {
+                let mut stmt = self
+                    .conn
+                    .prepare(
+                        "
+                        SELECT o.test_id, d.file_path,
+                               COUNT(*) AS co_runs,
+                               SUM(CASE WHEN o.status IN ('fail', 'error') THEN 1 ELSE 0 END) AS co_fails
+                        FROM test_outcomes o
+                        JOIN runs r ON r.run_id = o.run_id
+                        JOIN run_diff_files d ON d.run_id = o.run_id
+                        WHERE r.started_at < ?1
+                          AND o.status != 'skip'
+                        GROUP BY o.test_id, d.file_path
+                        ",
+                    )
+                    .map_err(store_err)?;
+
+                let rows = stmt
+                    .query_map(params![as_of_ts], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, i64>(2)?,
+                            r.get::<_, i64>(3)?,
+                        ))
+                    })
+                    .map_err(store_err)?;
+
+                for row in rows {
+                    let (test_id, file_path, co_runs, co_fails) = row.map_err(store_err)?;
+                    snapshot.cofail_counts.insert(
+                        (test_id, file_path),
+                        CoFailCounts {
+                            co_fails: co_fails.max(0) as u64,
+                            co_runs: co_runs.max(0) as u64,
+                        },
+                    );
+                }
             }
         }
 

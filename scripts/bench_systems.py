@@ -217,6 +217,11 @@ def pick_tracked_python_file(repo_dir: Path) -> Optional[Path]:
 
 def render_markdown_table(summary: dict[str, Any]) -> str:
     env = summary["environment"]
+    speedup = (
+        summary["cold_dry_run_p50_ms"] / summary["warm_dry_run_p50_ms"]
+        if summary["warm_dry_run_p50_ms"] > 0
+        else 1.0
+    )
     lines = [
         "### Systems Latency & Footprint Benchmarks",
         "",
@@ -226,9 +231,11 @@ def render_markdown_table(summary: dict[str, Any]) -> str:
         "",
         "| Metric | Value | Notes |",
         "| :--- | ---: | :--- |",
-        f"| Stripped release binary size (`pts`) | **{summary['stripped_binary_mb']:.2f} MB** | Unstripped: {summary['raw_binary_mb']:.2f} MB (single static SQLite + GBDT + Tree-sitter binary) |",
-        f"| `pts run --budget 15 --dry-run --json` (p50 / p95) | **{summary['dry_run_p50_ms']:.1f} ms / {summary['dry_run_p95_ms']:.1f} ms** | Cold-start CLI over {summary['runs']} runs (git diff + pytest collect + SQLite + AST + GBDT+Platt) |",
-        f"| `pts explain <test_id> --json` (p50 / p95) | **{summary['explain_p50_ms']:.1f} ms / {summary['explain_p95_ms']:.1f} ms** | Cold-start CLI over {summary['runs']} runs (16 features + signals + Platt probability) |",
+        f"| Stripped release binary size (`pts`) | **{summary['stripped_binary_mb']:.2f} MB** | Unstripped: {summary['raw_binary_mb']:.2f} MB (single static SQLite + GBDT + Tree-sitter + MCP binary) |",
+        f"| Warm CLI `pts run --budget 15 --dry-run --json` (p50 / p95) | **{summary['warm_dry_run_p50_ms']:.1f} ms / {summary['warm_dry_run_p95_ms']:.1f} ms** | Pure Rust cached discovery ({speedup:.1f}x faster than cold; git diff + SQLite + AST + GBDT+Platt) |",
+        f"| Warm CLI `pts explain <test_id> --json` (p50 / p95) | **{summary['warm_explain_p50_ms']:.1f} ms / {summary['warm_explain_p95_ms']:.1f} ms** | Pure Rust cached discovery over {summary['runs']} runs (16 features + signals + Platt probability) |",
+        f"| Cold CLI `pts run --budget 15 --dry-run --refresh-tests --json` (p50 / p95) | **{summary['cold_dry_run_p50_ms']:.1f} ms / {summary['cold_dry_run_p95_ms']:.1f} ms** | Includes external Python + `pytest --collect-only` startup across {summary['discovered_tests']:,} tests |",
+        f"| Cold CLI `pts explain <test_id> --refresh-tests --json` (p50 / p95) | **{summary['cold_explain_p50_ms']:.1f} ms / {summary['cold_explain_p95_ms']:.1f} ms** | Includes external Python + `pytest --collect-only` startup |",
         f"| Pure `pts-ml` scoring latency (1,000 tests, p50 / p95) | **{summary['ml_infer_p50_ms_per_1000']:.2f} ms / {summary['ml_infer_p95_ms_per_1000']:.2f} ms** | **{summary['ml_infer_tests_per_sec']:,.0f} tests/sec** (150-tree GBDT + Platt calibration) |",
     ]
     return "\n".join(lines)
@@ -309,13 +316,13 @@ def main() -> int:
         target_label = "synthetic-1000-tests-fixture"
 
     try:
-        print(f"[bench] Measuring `pts run --budget 15 --dry-run --json` ({args.runs} runs)...", file=sys.stderr)
-        dry_run_ms, dry_run_stdout = measure_command_latencies(
-            [str(pts_bin), "run", "--budget", "15", "--dry-run", "--json"],
+        # Prime the SQLite test discovery cache once before measuring warm CLI latency.
+        print("[bench] Priming SQLite discovery cache...", file=sys.stderr)
+        prime = run_cmd(
+            [str(pts_bin), "run", "--budget", "15", "--dry-run", "--json", "--refresh-tests"],
             cwd=repo_dir,
-            runs=args.runs,
         )
-        dry_run_report = json.loads(dry_run_stdout)
+        dry_run_report = json.loads(prime.stdout)
 
         test_id = args.test_id
         if not test_id:
@@ -325,11 +332,47 @@ def main() -> int:
             else:
                 raise RuntimeError("No selected tests returned by dry-run; pass --test-id explicitly.")
 
-        print(f"[bench] Measuring `pts explain {test_id} --json` ({args.runs} runs)...", file=sys.stderr)
-        explain_ms, _ = measure_command_latencies(
+        print(
+            f"[bench] Measuring WARM `pts run --budget 15 --dry-run --json` ({args.runs} runs, cached discovery)...",
+            file=sys.stderr,
+        )
+        warm_dry_run_ms, dry_run_stdout = measure_command_latencies(
+            [str(pts_bin), "run", "--budget", "15", "--dry-run", "--json"],
+            cwd=repo_dir,
+            runs=args.runs,
+        )
+        dry_run_report = json.loads(dry_run_stdout)
+
+        print(
+            f"[bench] Measuring WARM `pts explain {test_id} --json` ({args.runs} runs, cached discovery)...",
+            file=sys.stderr,
+        )
+        warm_explain_ms, _ = measure_command_latencies(
             [str(pts_bin), "explain", test_id, "--json"],
             cwd=repo_dir,
             runs=args.runs,
+        )
+
+        print(
+            f"[bench] Measuring COLD `pts run --budget 15 --dry-run --refresh-tests --json` ({args.runs} runs)...",
+            file=sys.stderr,
+        )
+        cold_dry_run_ms, _ = measure_command_latencies(
+            [str(pts_bin), "run", "--budget", "15", "--dry-run", "--json", "--refresh-tests"],
+            cwd=repo_dir,
+            runs=args.runs,
+            warmup=1,
+        )
+
+        print(
+            f"[bench] Measuring COLD `pts explain {test_id} --refresh-tests --json` ({args.runs} runs)...",
+            file=sys.stderr,
+        )
+        cold_explain_ms, _ = measure_command_latencies(
+            [str(pts_bin), "explain", test_id, "--json", "--refresh-tests"],
+            cwd=repo_dir,
+            runs=args.runs,
+            warmup=1,
         )
 
         summary = {
@@ -347,11 +390,15 @@ def main() -> int:
             "runs": args.runs,
             "raw_binary_mb": round(raw_mb, 2),
             "stripped_binary_mb": round(stripped_mb, 2),
-            "dry_run_p50_ms": round(percentile(dry_run_ms, 0.50), 2),
-            "dry_run_p95_ms": round(percentile(dry_run_ms, 0.95), 2),
+            "warm_dry_run_p50_ms": round(percentile(warm_dry_run_ms, 0.50), 2),
+            "warm_dry_run_p95_ms": round(percentile(warm_dry_run_ms, 0.95), 2),
+            "warm_explain_p50_ms": round(percentile(warm_explain_ms, 0.50), 2),
+            "warm_explain_p95_ms": round(percentile(warm_explain_ms, 0.95), 2),
+            "cold_dry_run_p50_ms": round(percentile(cold_dry_run_ms, 0.50), 2),
+            "cold_dry_run_p95_ms": round(percentile(cold_dry_run_ms, 0.95), 2),
+            "cold_explain_p50_ms": round(percentile(cold_explain_ms, 0.50), 2),
+            "cold_explain_p95_ms": round(percentile(cold_explain_ms, 0.95), 2),
             "explain_test_id": test_id,
-            "explain_p50_ms": round(percentile(explain_ms, 0.50), 2),
-            "explain_p95_ms": round(percentile(explain_ms, 0.95), 2),
             "ml_infer_batch_size": int(infer_data["batch_size"]),
             "ml_infer_p50_ms_per_1000": float(infer_data["median_ms_per_1000"]),
             "ml_infer_p95_ms_per_1000": float(infer_data["p95_ms_per_1000"]),

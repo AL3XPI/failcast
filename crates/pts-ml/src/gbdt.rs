@@ -5,9 +5,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::accumulator::{HistoryAccumulator, TrainingRow};
 use crate::features::{FEATURE_NAMES, NUM_FEATURES};
-use crate::platt::{PlattCalibrator, brier_score, logit, sigmoid};
+use crate::platt::{
+    MIN_CAL_FAILING_RUNS, MIN_CAL_POSITIVES, PlattCalibrator, brier_score, logit, sigmoid,
+};
 
 pub const MODEL_ARTIFACT_VERSION: u32 = 1;
+const MIN_TRAIN_RUN_FRACTION: f64 = 0.60;
 
 /// Verified against `forust-ml 0.8.1`: `GradientBooster::predict` outputs additive
 /// raw log-odds margins (`base_score + sum(tree_outputs)`), not sigmoid probabilities.
@@ -55,7 +58,9 @@ pub fn inverse_propensity_weight(sampling_propensity: f64) -> f64 {
     }
 }
 
-/// Strict chronological 80/20 split at a run timestamp boundary (`max_train_ts < min_cal_ts`).
+/// Strict chronological split at a run timestamp boundary (`max_train_ts < min_cal_ts`).
+/// Defaults to 80/20 and expands `cal_rows` backward down to 60% train when needed to
+/// satisfy Platt calibration support (`>= 5` positives across `>= 2` distinct failing runs).
 #[derive(Debug, Clone)]
 pub struct ChronologicalSplit {
     pub train_rows: Vec<TrainingRow>,
@@ -64,11 +69,17 @@ pub struct ChronologicalSplit {
     pub min_cal_ts: i64,
     pub train_run_count: usize,
     pub cal_run_count: usize,
+    pub cal_positives: usize,
+    pub cal_failing_runs: usize,
 }
 
 /// Builds leakage-free chronological features via `HistoryAccumulator` and partitions runs
-/// 80/20 at the run boundary, guaranteeing strict `max_train_ts < min_cal_ts` and zero
-/// `run_id` overlap between train and calibration sets.
+/// at a strict run timestamp boundary (`max_train_ts < min_cal_ts`) with zero `run_id` overlap.
+///
+/// Defaults to an 80/20 train/cal split. If the tail 20% slice has fewer than `MIN_CAL_POSITIVES`
+/// (5) positive outcomes or fewer than `MIN_CAL_FAILING_RUNS` (2) distinct failing runs, the
+/// calibration window expands backward run-by-run while strictly preserving `max_train_ts < min_cal_ts`,
+/// keeping at least 60% of runs in `train_rows`, and retaining both classes in `train_rows`.
 pub fn build_chronological_split(
     runs: &[HistoricalRun],
     commits: &[CommitRecord],
@@ -80,12 +91,33 @@ pub fn build_chronological_split(
         ));
     }
 
+    struct RunStats {
+        started_at: i64,
+        run_id: String,
+        pos_count: usize,
+        neg_count: usize,
+    }
+
     // Collect distinct runs present in the non-skip dataset in chronological order.
-    let mut run_order: Vec<(i64, String)> = Vec::new();
+    let mut run_order: Vec<RunStats> = Vec::new();
     for row in &dataset {
-        let key = (row.started_at, row.run_id.clone());
-        if run_order.last() != Some(&key) {
-            run_order.push(key);
+        let is_pos = row.label >= 0.5;
+        let same_run = run_order
+            .last()
+            .is_some_and(|r| r.started_at == row.started_at && r.run_id == row.run_id);
+        if !same_run {
+            run_order.push(RunStats {
+                started_at: row.started_at,
+                run_id: row.run_id.clone(),
+                pos_count: usize::from(is_pos),
+                neg_count: usize::from(!is_pos),
+            });
+        } else if let Some(last) = run_order.last_mut() {
+            if is_pos {
+                last.pos_count += 1;
+            } else {
+                last.neg_count += 1;
+            }
         }
     }
 
@@ -100,13 +132,17 @@ pub fn build_chronological_split(
     let target_train = ((total_runs as f64) * 0.80).floor() as usize;
     let target_train = target_train.clamp(1, total_runs - 1);
 
-    // Ensure the split falls strictly between distinct timestamps (`max_train_ts < min_cal_ts`).
-    let split_idx = if run_order[target_train - 1].0 < run_order[target_train].0 {
+    // Ensure the default 80/20 split falls strictly between distinct timestamps (`max_train_ts < min_cal_ts`).
+    let default_split_idx = if run_order[target_train - 1].started_at
+        < run_order[target_train].started_at
+    {
         target_train
     } else {
         // Try moving right past the timestamp tie group.
         let mut right = target_train;
-        while right < total_runs && run_order[right].0 == run_order[target_train - 1].0 {
+        while right < total_runs
+            && run_order[right].started_at == run_order[target_train - 1].started_at
+        {
             right += 1;
         }
         if right < total_runs {
@@ -114,7 +150,7 @@ pub fn build_chronological_split(
         } else {
             // Otherwise move left before the timestamp tie group.
             let mut left = target_train;
-            while left > 0 && run_order[left - 1].0 == run_order[target_train].0 {
+            while left > 0 && run_order[left - 1].started_at == run_order[target_train].started_at {
                 left -= 1;
             }
             if left > 0 {
@@ -128,8 +164,50 @@ pub fn build_chronological_split(
         }
     };
 
-    let max_train_ts = run_order[split_idx - 1].0;
-    let min_cal_ts = run_order[split_idx].0;
+    let cal_support = |idx: usize| -> (usize, usize) {
+        let mut pos = 0usize;
+        let mut failing_runs = 0usize;
+        for r in &run_order[idx..] {
+            if r.pos_count > 0 {
+                pos += r.pos_count;
+                failing_runs += 1;
+            }
+        }
+        (pos, failing_runs)
+    };
+    let train_has_both_classes = |idx: usize| -> bool {
+        let mut pos = 0usize;
+        let mut neg = 0usize;
+        for r in &run_order[..idx] {
+            pos += r.pos_count;
+            neg += r.neg_count;
+        }
+        pos > 0 && neg > 0
+    };
+
+    let mut split_idx = default_split_idx;
+    let (default_cal_pos, default_cal_fail_runs) = cal_support(default_split_idx);
+    if default_cal_pos < MIN_CAL_POSITIVES || default_cal_fail_runs < MIN_CAL_FAILING_RUNS {
+        let min_train_runs = ((total_runs as f64) * MIN_TRAIN_RUN_FRACTION).ceil() as usize;
+        let min_train_runs = min_train_runs.clamp(1, default_split_idx);
+        for cand_idx in (min_train_runs..default_split_idx).rev() {
+            if run_order[cand_idx - 1].started_at >= run_order[cand_idx].started_at {
+                continue;
+            }
+            if !train_has_both_classes(cand_idx) {
+                continue;
+            }
+            let (cand_pos, cand_fail_runs) = cal_support(cand_idx);
+            if cand_pos >= MIN_CAL_POSITIVES && cand_fail_runs >= MIN_CAL_FAILING_RUNS {
+                split_idx = cand_idx;
+                break;
+            }
+        }
+    }
+
+    let (cal_positives, cal_failing_runs) = cal_support(split_idx);
+    let max_train_ts = run_order[split_idx - 1].started_at;
+    let min_cal_ts = run_order[split_idx].started_at;
     debug_assert!(max_train_ts < min_cal_ts);
 
     let mut train_rows = Vec::new();
@@ -156,6 +234,8 @@ pub fn build_chronological_split(
         min_cal_ts,
         train_run_count: split_idx,
         cal_run_count: total_runs - split_idx,
+        cal_positives,
+        cal_failing_runs,
     })
 }
 
@@ -169,6 +249,8 @@ pub struct ModelArtifact {
     pub booster_json: String,
     pub platt_a: f64,
     pub platt_b: f64,
+    #[serde(default)]
+    pub calibration_fallback: bool,
     pub train_rows: usize,
     pub pos_rows: usize,
     pub brier_score: f64,
@@ -270,6 +352,8 @@ pub struct TrainResult {
     pub cal_run_count: usize,
     pub cal_rows: usize,
     pub cal_pos_rows: usize,
+    pub cal_failing_runs: usize,
+    pub calibration_fallback: bool,
     pub min_cal_ts: i64,
     pub uncalibrated_brier: f64,
     pub calibrated_brier: f64,
@@ -341,8 +425,11 @@ pub fn train_gbdt_model(
         .map(|raw| normalize_to_log_odds(raw, BOOSTER_PREDICTS_RAW_MARGINS))
         .collect();
 
-    let train_base_rate = train_pos as f64 / (train_labels.len() as f64);
-    let calibrator = PlattCalibrator::fit(&cal_raw_margins, &cal_labels_bool, train_base_rate);
+    let (calibrator, calibration_fallback) = PlattCalibrator::fit_with_guardrail(
+        &cal_raw_margins,
+        &cal_labels_bool,
+        split.cal_failing_runs,
+    );
 
     let uncalibrated_probs: Vec<f64> = cal_raw_margins.iter().map(|&z| sigmoid(z)).collect();
     let calibrated_probs: Vec<f64> = cal_raw_margins
@@ -374,6 +461,7 @@ pub fn train_gbdt_model(
         booster_json,
         platt_a: calibrator.a,
         platt_b: calibrator.b,
+        calibration_fallback,
         train_rows: split.train_rows.len(),
         pos_rows: train_pos,
         brier_score: calibrated_brier,
@@ -391,6 +479,8 @@ pub fn train_gbdt_model(
         cal_run_count: split.cal_run_count,
         cal_rows: split.cal_rows.len(),
         cal_pos_rows,
+        cal_failing_runs: split.cal_failing_runs,
+        calibration_fallback,
         min_cal_ts: split.min_cal_ts,
         uncalibrated_brier,
         calibrated_brier,

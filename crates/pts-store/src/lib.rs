@@ -53,6 +53,7 @@ pub mod tests {
             "run_diff_files",
             "test_outcomes",
             "models",
+            "repo_meta",
         ]
         .into_iter()
         .map(String::from)
@@ -62,14 +63,56 @@ pub mod tests {
         let versions: Vec<i64> = {
             let mut s = store
                 .connection()
-                .prepare("SELECT version FROM schema_migrations")
+                .prepare("SELECT version FROM schema_migrations ORDER BY version ASC")
                 .expect("prepare migrations query");
             s.query_map([], |r| r.get(0))
                 .expect("query migrations")
                 .map(|r| r.expect("version row"))
                 .collect()
         };
-        assert_eq!(versions, vec![1]);
+        assert_eq!(versions, vec![1, 2]);
+
+        // Verify repo_meta and active test cache sync/deactivation round-trip.
+        let mut store = Store::open(&db_path).expect("reopen store");
+        assert_eq!(
+            store.get_meta("discovery_fingerprint").expect("get_meta"),
+            None
+        );
+        let initial_tests = vec![
+            TestCase {
+                test_id: "tests/test_a.py::test_1".to_string(),
+                file_path: "tests/test_a.py".to_string(),
+            },
+            TestCase {
+                test_id: "tests/test_a.py::test_2".to_string(),
+                file_path: "tests/test_a.py".to_string(),
+            },
+        ];
+        store
+            .sync_discovered_tests(&initial_tests, "fp-v1", 100)
+            .expect("sync initial tests");
+        assert_eq!(
+            store.get_meta("discovery_fingerprint").expect("get_meta"),
+            Some("fp-v1".to_string())
+        );
+        assert_eq!(
+            store.load_active_tests().expect("load_active_tests"),
+            initial_tests
+        );
+
+        // Removing test_2 marks it inactive without deleting it.
+        let updated_tests = vec![initial_tests[0].clone()];
+        store
+            .sync_discovered_tests(&updated_tests, "fp-v2", 200)
+            .expect("sync updated tests");
+        assert_eq!(
+            store.load_active_tests().expect("load updated active"),
+            updated_tests
+        );
+        assert_eq!(
+            store.get_meta("discovery_fingerprint").expect("get_meta"),
+            Some("fp-v2".to_string())
+        );
     }
 
     #[test]

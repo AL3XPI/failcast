@@ -20,7 +20,10 @@ pub use gbdt::{
     inverse_propensity_weight, normalize_to_log_odds, to_column_major, train_gbdt_model,
 };
 pub use heuristic::{ast_hop_decay, score_heuristic, should_use_heuristic};
-pub use platt::{PlattCalibrator, brier_score, logit, sigmoid};
+pub use platt::{
+    MIN_CAL_FAILING_RUNS, MIN_CAL_POSITIVES, PlattCalibrator, brier_score, logit, logit_log_loss,
+    sigmoid,
+};
 pub use selector::{
     CandidateTest, DEFAULT_MEDIAN_DURATION_MS, MIN_EFF_DURATION_MS, SelectedTest,
     SelectionStrategy, select_tests,
@@ -509,25 +512,149 @@ pub mod tests {
             "Platt calibration must lower Brier score: cal={cal_brier:.6} vs raw={raw_brier:.6}"
         );
 
-        // 2. Inverted logits (where unconstrained slope would be negative) must clamp/fallback to a >= 0.
-        let inverted_logits: Vec<f64> = vec![-3.0, -2.5, -2.0, -1.5, 1.5, 2.0, 2.5, 3.0];
-        let inverted_labels: Vec<bool> = vec![true, true, true, true, false, false, false, false];
+        // 2. Inverted logits (where unconstrained slope would be negative) must fall back to identity (a=1, b=0).
+        let inverted_logits: Vec<f64> = vec![-3.0, -2.5, -2.0, -1.5, -1.0, 1.0, 1.5, 2.0, 2.5, 3.0];
+        let inverted_labels: Vec<bool> = vec![
+            true, true, true, true, true, false, false, false, false, false,
+        ];
         let inv_cal = PlattCalibrator::fit(&inverted_logits, &inverted_labels, 0.25);
-        assert!(inv_cal.a >= 0.0 && inv_cal.a.is_finite() && inv_cal.b.is_finite());
+        assert!(inv_cal.a > 0.0 && inv_cal.a.is_finite() && inv_cal.b.is_finite());
         assert!((inv_cal.a - 1.0).abs() < 1e-12);
-        assert!((inv_cal.b - logit(0.25)).abs() < 1e-12);
+        assert!((inv_cal.b - 0.0).abs() < 1e-12);
 
-        // 3. Degenerate 0-positive and 0-negative calibration splits must fall back deterministically without NaN.
+        // 3. Degenerate 0-positive and 0-negative calibration splits must fall back deterministically to identity without NaN.
         let zero_pos =
             PlattCalibrator::fit(&[-1.0, 0.0, 1.0, 2.0], &[false, false, false, false], 0.15);
         assert!((zero_pos.a - 1.0).abs() < 1e-12);
-        assert!((zero_pos.b - logit(0.15)).abs() < 1e-12);
+        assert!((zero_pos.b - 0.0).abs() < 1e-12);
         assert!(zero_pos.predict_prob(0.5).is_finite());
 
         let zero_neg = PlattCalibrator::fit(&[-1.0, 0.0, 1.0], &[true, true, true], 0.0);
         assert!((zero_neg.a - 1.0).abs() < 1e-12);
-        assert!((zero_neg.b - logit(1e-4)).abs() < 1e-12);
+        assert!((zero_neg.b - 0.0).abs() < 1e-12);
         assert!(zero_neg.predict_prob(0.5).is_finite());
+    }
+
+    #[test]
+    fn platt_expands_cal_window_and_falls_back_to_identity() {
+        use pts_core::{DiffFile, DiffSummary, HistoricalOutcome, HistoricalRun, TestStatus};
+
+        // Helper to build N chronological runs where specified run indices have `fail_count` failures.
+        let build_runs =
+            |total_runs: usize, failing_map: &[(usize, usize)]| -> Vec<HistoricalRun> {
+                let mut runs = Vec::with_capacity(total_runs);
+                for r in 0..total_runs {
+                    let ts = 1_720_000_000 + (r as i64) * 3600;
+                    let fail_count = failing_map
+                        .iter()
+                        .find(|&&(idx, _)| idx == r)
+                        .map(|&(_, c)| c)
+                        .unwrap_or(0);
+                    let diff_files = vec![DiffFile {
+                        path: format!("src/mod_{}.py", r % 3),
+                        lines_added: 10,
+                        lines_deleted: 2,
+                    }];
+                    let diff_fp = DiffSummary::compute_fingerprint(&diff_files);
+                    let mut outcomes = Vec::with_capacity(8);
+                    for t in 0..8 {
+                        outcomes.push(HistoricalOutcome {
+                            test_id: format!("tests/test_m.py::test_{t}"),
+                            file_path: "tests/test_m.py".to_string(),
+                            status: if t < fail_count {
+                                TestStatus::Fail
+                            } else {
+                                TestStatus::Pass
+                            },
+                            duration_ms: 50,
+                            sampling_propensity: 1.0,
+                            ast_min_hop: if t < 2 { Some(1) } else { None },
+                        });
+                    }
+                    runs.push(HistoricalRun {
+                        run_id: format!("run-{r:03}"),
+                        commit_sha: Some(format!("sha-{r:03}")),
+                        diff_fingerprint: diff_fp,
+                        started_at: ts,
+                        diff_files,
+                        outcomes,
+                    });
+                }
+                runs
+            };
+
+        // Case 1: 20 runs total -> default 80/20 split is runs[0..16] train, runs[16..20] cal.
+        // Put only 1 failing run in tail 20% (run 18, 3 fails) and a 2nd failing run at run 14 (3 fails)
+        // plus training failures at runs 2 and 5. The splitter must expand cal_set backward to include
+        // run 14 (split_idx = 14, >= 60% = 12) while strictly preserving max_train_ts < min_cal_ts.
+        let runs_expand = build_runs(20, &[(2, 3), (5, 3), (14, 3), (18, 3)]);
+        let split = build_chronological_split(&runs_expand, &[]).expect("expanded split");
+        assert!(
+            split.max_train_ts < split.min_cal_ts,
+            "strict anti-leakage must hold after window expansion"
+        );
+        assert_eq!(split.train_run_count, 14);
+        assert_eq!(split.cal_run_count, 6);
+        assert_eq!(split.cal_failing_runs, 2);
+        assert_eq!(split.cal_positives, 6);
+
+        // Case 2: Insufficient support even down to 60% (only 1 failing run in runs[12..20]).
+        // Training must succeed and deterministically fall back to identity sigmoid (a=1.0, b=0.0).
+        let runs_sparse = build_runs(20, &[(2, 4), (5, 4), (18, 3)]);
+        let trained_sparse =
+            train_gbdt_model(&runs_sparse, &[], 1_730_000_000).expect("train sparse");
+        assert!(
+            trained_sparse.calibration_fallback,
+            "insufficient cal_set support must set calibration_fallback = true"
+        );
+        assert!(trained_sparse.model.artifact.calibration_fallback);
+        assert!((trained_sparse.model.artifact.platt_a - 1.0).abs() < 1e-12);
+        assert!((trained_sparse.model.artifact.platt_b - 0.0).abs() < 1e-12);
+
+        // Case 3: Perfectly calibrated logits where fitted Platt cannot strictly improve log-loss
+        // over identity (a=1.0, b=0.0) must trigger identity fallback.
+        let mut cal_logits = Vec::new();
+        let mut cal_labels = Vec::new();
+        for _ in 0..10 {
+            cal_logits.push(2.197_224_577); // sigmoid ~= 0.9
+            cal_labels.push(true);
+        }
+        cal_logits.push(2.197_224_577);
+        cal_labels.push(false);
+        for _ in 0..10 {
+            cal_logits.push(-2.197_224_577); // sigmoid ~= 0.1
+            cal_labels.push(false);
+        }
+        cal_logits.push(-2.197_224_577);
+        cal_labels.push(true);
+        // Check guardrail directly: if Platt doesn't beat identity log-loss, fallback is true;
+        // and if distinct_failing_runs < 2, fallback is always true.
+        let (cal_low_runs, fb_low_runs) =
+            PlattCalibrator::fit_with_guardrail(&cal_logits, &cal_labels, 1);
+        assert!(fb_low_runs);
+        assert!((cal_low_runs.a - 1.0).abs() < 1e-12);
+        assert!((cal_low_runs.b - 0.0).abs() < 1e-12);
+
+        // Inverted logits with sufficient support also fail log-loss & slope guardrail -> identity fallback.
+        let inv_logits = [-3.0, -2.5, -2.0, -1.5, -1.0, 1.0, 1.5, 2.0, 2.5, 3.0];
+        let inv_labels = [
+            true, true, true, true, true, false, false, false, false, false,
+        ];
+        let (cal_inv, fb_inv) = PlattCalibrator::fit_with_guardrail(&inv_logits, &inv_labels, 3);
+        assert!(fb_inv);
+        assert!((cal_inv.a - 1.0).abs() < 1e-12);
+        assert!((cal_inv.b - 0.0).abs() < 1e-12);
+
+        // Case 4: Backwards-compatible ModelArtifact deserialization when calibration_fallback is omitted.
+        let mut artifact_val: serde_json::Value =
+            serde_json::to_value(&trained_sparse.model.artifact).expect("to_value");
+        artifact_val
+            .as_object_mut()
+            .expect("json obj")
+            .remove("calibration_fallback");
+        let parsed: ModelArtifact =
+            serde_json::from_value(artifact_val).expect("legacy ModelArtifact");
+        assert!(!parsed.calibration_fallback);
     }
 
     #[test]

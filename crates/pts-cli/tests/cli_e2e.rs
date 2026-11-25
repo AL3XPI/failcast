@@ -1119,4 +1119,140 @@ mod tests {
                 .is_some_and(|b| b.len() == 3)
         );
     }
+
+    #[test]
+    fn cli_discovery_cache_hits_and_invalidates_on_test_change() {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        copy_dir_recursive(&fixture_repo_path(), tmp.path());
+
+        git_cmd(tmp.path(), &["init"]);
+        git_cmd(tmp.path(), &["add", "."]);
+        git_cmd(tmp.path(), &["commit", "-m", "initial commit"]);
+
+        // Create a wrapper around pytest that logs every invocation so we can assert
+        // exact cache hits vs. invalidations deterministically.
+        let calls_log = tmp.path().join("pytest_calls.log");
+        let wrapper_path = tmp.path().join("pytest_wrapper.sh");
+        let wrapper_script = format!(
+            "#!/bin/sh\necho call >> \"{}\"\nexec pytest \"$@\"\n",
+            calls_log.display()
+        );
+        fs::write(&wrapper_path, wrapper_script).expect("write pytest wrapper");
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(&wrapper_path).expect("meta").permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&wrapper_path, perms).expect("chmod +x wrapper");
+        }
+
+        fs::write(
+            tmp.path().join(".pts.toml"),
+            format!("pytest_bin = \"{}\"\n", wrapper_path.display()),
+        )
+        .expect("write .pts.toml");
+
+        let count_pytest_calls = || -> usize {
+            fs::read_to_string(&calls_log)
+                .map(|s| s.lines().count())
+                .unwrap_or(0)
+        };
+
+        cargo_bin_cmd!("pts")
+            .current_dir(tmp.path())
+            .arg("init")
+            .assert()
+            .success();
+
+        // 1. First dry-run misses cache -> invokes pytest --collect-only once and populates cache.
+        let out1 = cargo_bin_cmd!("pts")
+            .current_dir(tmp.path())
+            .args(["run", "--budget", "5", "--dry-run", "--json"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let json1: serde_json::Value = serde_json::from_slice(&out1).expect("parse json1");
+        assert_eq!(json1["total_discovered_tests"], 4);
+        assert_eq!(
+            count_pytest_calls(),
+            1,
+            "first dry-run must invoke pytest once"
+        );
+
+        // 2. Second dry-run AND `pts explain` hit SQLite cache -> zero new pytest invocations!
+        let out2 = cargo_bin_cmd!("pts")
+            .current_dir(tmp.path())
+            .args(["run", "--budget", "5", "--dry-run", "--json"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let json2: serde_json::Value = serde_json::from_slice(&out2).expect("parse json2");
+        assert_eq!(json2["total_discovered_tests"], 4);
+        assert_eq!(
+            count_pytest_calls(),
+            1,
+            "second dry-run must hit SQLite discovery cache without invoking pytest"
+        );
+
+        cargo_bin_cmd!("pts")
+            .current_dir(tmp.path())
+            .args(["explain", "tests/test_calc.py::test_add_positive", "--json"])
+            .assert()
+            .success();
+        assert_eq!(
+            count_pytest_calls(),
+            1,
+            "pts explain must also hit SQLite discovery cache"
+        );
+
+        // 3. Adding a new test to tests/test_calc.py changes the discovery fingerprint -> cache miss.
+        let test_file = tmp.path().join("tests/test_calc.py");
+        let mut test_src = fs::read_to_string(&test_file).expect("read test_calc.py");
+        test_src.push_str("\n\ndef test_cache_invalidation_check():\n    assert 2 + 2 == 4\n");
+        fs::write(&test_file, test_src).expect("update test_calc.py");
+
+        let out3 = cargo_bin_cmd!("pts")
+            .current_dir(tmp.path())
+            .args(["run", "--budget", "5", "--dry-run", "--json"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let json3: serde_json::Value = serde_json::from_slice(&out3).expect("parse json3");
+        assert_eq!(
+            json3["total_discovered_tests"], 5,
+            "cache invalidation must pick up newly added test"
+        );
+        assert_eq!(
+            count_pytest_calls(),
+            2,
+            "test file modification must invalidate cache and re-run pytest"
+        );
+
+        // 4. `--refresh-tests` forces fresh discovery even when fingerprint is unchanged.
+        cargo_bin_cmd!("pts")
+            .current_dir(tmp.path())
+            .args([
+                "run",
+                "--budget",
+                "5",
+                "--dry-run",
+                "--json",
+                "--refresh-tests",
+            ])
+            .assert()
+            .success();
+        assert_eq!(
+            count_pytest_calls(),
+            3,
+            "--refresh-tests must force pytest discovery"
+        );
+    }
 }

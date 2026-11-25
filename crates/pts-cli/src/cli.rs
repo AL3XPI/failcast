@@ -96,6 +96,10 @@ pub struct RunArgs {
     /// Emit machine-readable JSON output to stdout.
     #[arg(long)]
     pub json: bool,
+
+    /// Bypass the SQLite test discovery cache and force `pytest --collect-only`.
+    #[arg(long)]
+    pub refresh_tests: bool,
 }
 
 #[derive(Debug, Args)]
@@ -106,6 +110,10 @@ pub struct ExplainArgs {
     /// Emit machine-readable JSON output to stdout.
     #[arg(long)]
     pub json: bool,
+
+    /// Bypass the SQLite test discovery cache and force `pytest --collect-only`.
+    #[arg(long)]
+    pub refresh_tests: bool,
 }
 
 #[derive(Debug, Args)]
@@ -359,15 +367,21 @@ fn cmd_train(repo_root: &Path) -> Result<()> {
         result.calibrated_brier, result.uncalibrated_brier
     );
     println!(
-        "  Platt: a={:.6}, b={:.6}",
-        artifact.platt_a, artifact.platt_b
+        "  Platt: a={:.6}, b={:.6}{}",
+        artifact.platt_a,
+        artifact.platt_b,
+        if artifact.calibration_fallback {
+            " (identity fallback)"
+        } else {
+            ""
+        }
     );
 
     Ok(())
 }
 
 fn cmd_explain(repo_root: &Path, args: ExplainArgs) -> Result<()> {
-    let report = explain_test(repo_root, &args.test_id)?;
+    let report = explain_test(repo_root, &args.test_id, args.refresh_tests)?;
     emit_explain_report(&report, args.json)?;
     Ok(())
 }
@@ -728,7 +742,7 @@ fn cmd_run(repo_root: &Path, args: RunArgs) -> Result<i32> {
     };
 
     if args.dry_run {
-        let plan = select_for_working_tree(repo_root, request)?;
+        let plan = select_for_working_tree(repo_root, request, args.refresh_tests)?;
         emit_dry_run_report(
             plan.mode_label,
             plan.model_mode,
@@ -740,7 +754,7 @@ fn cmd_run(repo_root: &Path, args: RunArgs) -> Result<i32> {
         return Ok(0);
     }
 
-    let report = run_selected_tests(repo_root, request)?;
+    let report = run_selected_tests(repo_root, request, args.refresh_tests)?;
     emit_run_report(&report, args.json)?;
     Ok(report.exit_code)
 }

@@ -56,6 +56,9 @@ pub struct SelectTestsParams {
     /// Target failure recall in `(0, 1)` (mutually exclusive with `top_k`).
     #[serde(default)]
     pub target_recall: Option<f64>,
+    /// If true, bypass the SQLite discovery cache and force `pytest --collect-only`.
+    #[serde(default)]
+    pub refresh_tests: Option<bool>,
 }
 
 /// Selected test entry returned by `select_tests`.
@@ -90,6 +93,9 @@ pub struct RunFastTestsParams {
     /// If true, run the entire discovered test suite instead of selecting a subset.
     #[serde(default)]
     pub run_all: bool,
+    /// If true, bypass the SQLite discovery cache and force `pytest --collect-only`.
+    #[serde(default)]
+    pub refresh_tests: Option<bool>,
 }
 
 /// Structured output for the `run_fast_tests` MCP tool (SPEC.md Section 6.2).
@@ -110,6 +116,9 @@ pub struct RunFastTestsOutput {
 pub struct ExplainSelectionParams {
     /// Canonical test identifier (e.g. `"tests/test_auth.py::test_refresh_token"`).
     pub test_id: String,
+    /// If true, bypass the SQLite discovery cache and force `pytest --collect-only`.
+    #[serde(default)]
+    pub refresh_tests: Option<bool>,
 }
 
 /// Local stdio MCP server exposing PTS selection, execution, and explainability tools.
@@ -160,7 +169,11 @@ impl PtsMcpServer {
                 SelectionRequest::Budget { budget_seconds }
             };
 
-            let plan = select_for_working_tree(&repo_root, request)?;
+            let plan = select_for_working_tree(
+                &repo_root,
+                request,
+                params.refresh_tests.unwrap_or(false),
+            )?;
             let selected: Vec<McpSelectedTest> = plan
                 .selected_plan
                 .unwrap_or_default()
@@ -214,7 +227,8 @@ impl PtsMcpServer {
                 SelectionRequest::Budget { budget_seconds }
             };
 
-            let report = run_selected_tests(&repo_root, request)?;
+            let report =
+                run_selected_tests(&repo_root, request, params.refresh_tests.unwrap_or(false))?;
             Ok(RunFastTestsOutput {
                 run_id: report.run_id,
                 model_mode: report.model_mode,
@@ -244,10 +258,12 @@ impl PtsMcpServer {
     ) -> Result<Json<ExplainReport>, String> {
         let repo_root = Arc::clone(&self.repo_root);
         let test_id = params.test_id;
-        let report = tokio::task::spawn_blocking(move || explain_test(&repo_root, &test_id))
-            .await
-            .map_err(|e| format!("blocking task panicked: {e}"))?
-            .map_err(|e| format!("{e:#}"))?;
+        let refresh_tests = params.refresh_tests.unwrap_or(false);
+        let report =
+            tokio::task::spawn_blocking(move || explain_test(&repo_root, &test_id, refresh_tests))
+                .await
+                .map_err(|e| format!("blocking task panicked: {e}"))?
+                .map_err(|e| format!("{e:#}"))?;
 
         Ok(Json(report))
     }

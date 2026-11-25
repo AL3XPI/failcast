@@ -261,6 +261,119 @@ def plot_pareto_fdr_vs_budget(
     plt.close(fig)
 
 
+def _point_to_segment_dist(
+    px: float, py: float, x1: float, y1: float, x2: float, y2: float
+) -> float:
+    vx, vy = x2 - x1, y2 - y1
+    seg_len_sq = vx * vx + vy * vy
+    if seg_len_sq <= 1e-12:
+        return ((px - x1) ** 2 + (py - y1) ** 2) ** 0.5
+    t = max(0.0, min(1.0, ((px - x1) * vx + (py - y1) * vy) / seg_len_sq))
+    proj_x = x1 + t * vx
+    proj_y = y1 + t * vy
+    return ((px - proj_x) ** 2 + (py - proj_y) ** 2) ** 0.5
+
+
+def choose_reliability_label_offsets(
+    xs: list[float],
+    ys: list[float],
+    labels: list[str],
+) -> list[tuple[float, float]]:
+    """Greedily pick non-overlapping (dx_pt, dy_pt) offsets that avoid curve segments & badges."""
+    # Approximate data-units per point for a ~4.5in x 3.5in panel (data span ~1.08 x 1.22).
+    dx_scale = 1.08 / 320.0
+    dy_scale = 1.22 / 245.0
+
+    # Candidate offsets ordered from closest/cleanest to staggered callouts.
+    candidates = [
+        (0.0, 12.0),
+        (0.0, -16.0),
+        (16.0, 12.0),
+        (-16.0, 12.0),
+        (16.0, -16.0),
+        (-16.0, -16.0),
+        (22.0, 4.0),
+        (-22.0, 4.0),
+        (0.0, 24.0),
+        (0.0, -26.0),
+        (24.0, 18.0),
+        (-24.0, 18.0),
+        (24.0, -22.0),
+        (-24.0, -22.0),
+    ]
+
+    segments = [
+        (xs[i], ys[i], xs[i + 1], ys[i + 1]) for i in range(len(xs) - 1)
+    ]
+    placed_boxes: list[tuple[float, float, float, float]] = []
+    chosen: list[tuple[float, float]] = []
+
+    for idx, (x_val, y_val, text) in enumerate(zip(xs, ys, labels)):
+        half_w = max(0.048, len(text) * 0.0115)
+        half_h = 0.036
+
+        best_score = float("inf")
+        best_offset = (0.0, 12.0)
+
+        for dx_pt, dy_pt in candidates:
+            cx = x_val + dx_pt * dx_scale
+            cy = y_val + dy_pt * dy_scale
+
+            score = 0.002 * ((dx_pt**2 + dy_pt**2) ** 0.5)
+
+            # Keep inside visible axes bounds.
+            if cx - half_w < -0.04 or cx + half_w > 1.04:
+                score += 50.0
+            if cy - half_h < -0.10 or cy + half_h > 1.10:
+                score += 50.0
+
+            # Avoid Brier badge region (right side, y in [0.34, 0.58], x in [0.58, 1.02]).
+            if cx + half_w > 0.58 and cy + half_h > 0.34 and cy - half_h < 0.58:
+                score += 40.0
+
+            # Strong penalty for overlapping any already placed label box.
+            for px, py, pw, ph in placed_boxes:
+                ox = (half_w + pw + 0.018) - abs(cx - px)
+                oy = (half_h + ph + 0.018) - abs(cy - py)
+                if ox > 0.0 and oy > 0.0:
+                    score += 100.0 + 200.0 * ox * oy
+
+            # Penalize landing on top of any data marker (other than slight distance from self).
+            for j, (ox_pt, oy_pt) in enumerate(zip(xs, ys)):
+                if j == idx:
+                    continue
+                d_pt = ((cx - ox_pt) ** 2 + (cy - oy_pt) ** 2) ** 0.5
+                if d_pt < 0.06:
+                    score += 35.0 * (0.06 - d_pt) / 0.06
+
+            # Penalize intersecting or sitting directly on any reliability curve segment.
+            for sx1, sy1, sx2, sy2 in segments:
+                dist = _point_to_segment_dist(cx, cy, sx1, sy1, sx2, sy2)
+                if dist < 0.055:
+                    score += 25.0 * (0.055 - dist) / 0.055
+
+            # Mild penalty for sitting right on the y = x perfect-calibration diagonal.
+            diag_dist = abs(cy - cx) / (2.0**0.5)
+            if diag_dist < 0.04:
+                score += 8.0 * (0.04 - diag_dist) / 0.04
+
+            if score < best_score:
+                best_score = score
+                best_offset = (dx_pt, dy_pt)
+
+        chosen.append(best_offset)
+        placed_boxes.append(
+            (
+                x_val + best_offset[0] * dx_scale,
+                y_val + best_offset[1] * dy_scale,
+                half_w,
+                half_h,
+            )
+        )
+
+    return chosen
+
+
 def plot_calibration_reliability(
     report: dict[str, Any],
     out_path: Path,
@@ -342,39 +455,39 @@ def plot_calibration_reliability(
                 label=panel_title,
             )
 
-            # Annotate populated bins with sample counts, staggering adjacent crowded labels.
-            prev_xy: tuple[float, float] | None = None
-            stagger_toggle = False
-            for x_val, y_val, cnt in zip(xs, ys, counts):
-                label_txt = f"n={cnt:,}" if cnt < 10000 else f"n={cnt / 1000:.1f}k"
-                crowded = (
-                    prev_xy is not None
-                    and abs(x_val - prev_xy[0]) < 0.12
-                    and abs(y_val - prev_xy[1]) < 0.12
+            # Annotate populated bins with non-overlapping offsets avoiding curve lines and badges.
+            label_texts = [
+                f"n={cnt:,}" if cnt < 10000 else f"n={cnt / 1000:.1f}k" for cnt in counts
+            ]
+            offsets = choose_reliability_label_offsets(xs, ys, label_texts)
+            for x_val, y_val, label_txt, (dx_pt, dy_pt) in zip(xs, ys, label_texts, offsets):
+                dist_pt = (dx_pt**2 + dy_pt**2) ** 0.5
+                arrowprops = (
+                    {
+                        "arrowstyle": "-",
+                        "color": "#94A3B8",
+                        "lw": 0.75,
+                        "shrinkA": 2,
+                        "shrinkB": 4,
+                    }
+                    if dist_pt > 15.0
+                    else None
                 )
-                if crowded:
-                    stagger_toggle = not stagger_toggle
-                else:
-                    stagger_toggle = False
-                if y_val > 0.85:
-                    offset_y = -15 if not stagger_toggle else -26
-                elif stagger_toggle:
-                    offset_y = 20
-                else:
-                    offset_y = 9
                 ax_top.annotate(
                     label_txt,
                     xy=(x_val, y_val),
-                    xytext=(0, offset_y),
+                    xytext=(dx_pt, dy_pt),
                     textcoords="offset points",
                     ha="center",
-                    fontsize=7.3,
-                    color="#334155",
+                    va="center",
+                    fontsize=7.4,
+                    color="#1E293B",
+                    arrowprops=arrowprops,
+                    zorder=6,
                 )
-                prev_xy = (x_val, y_val)
 
-        ax_top.set_xlim(-0.04, 1.04)
-        ax_top.set_ylim(-0.06, 1.08)
+        ax_top.set_xlim(-0.05, 1.05)
+        ax_top.set_ylim(-0.11, 1.12)
         ax_top.grid(True, linestyle="--", alpha=0.7)
         ax_top.spines["top"].set_visible(False)
         ax_top.spines["right"].set_visible(False)
@@ -419,7 +532,7 @@ def plot_calibration_reliability(
             ax_bot.set_ylim(0.8, max_count * 2.5)
         else:
             ax_bot.set_ylim(0, max_count * 1.25)
-        ax_bot.set_xlim(-0.04, 1.04)
+        ax_bot.set_xlim(-0.05, 1.05)
         ax_bot.set_xticks([0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
         ax_bot.set_xlabel("Mean Predicted Failure Probability", fontweight="bold", labelpad=6)
         if col == 0:
@@ -432,7 +545,12 @@ def plot_calibration_reliability(
     if repo_label:
         title = f"{title} — {repo_label}"
     fig.suptitle(title, x=0.06, y=0.99, ha="left", fontweight="bold", fontsize=13.0)
-    if platt_brier <= raw_brier and raw_brier > 0:
+    if abs(raw_brier - platt_brier) < 1e-9:
+        subtitle = (
+            f"Walk-forward Brier score across {total_samples:,} outcomes: "
+            f"Raw GBDT {raw_brier:.4f} vs. Platt-Calibrated {platt_brier:.4f} (identity guardrail active)"
+        )
+    elif platt_brier < raw_brier and raw_brier > 0:
         rel_pct = (raw_brier - platt_brier) / raw_brier * 100.0
         subtitle = (
             f"Walk-forward Brier score across {total_samples:,} outcomes: "

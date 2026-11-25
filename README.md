@@ -100,8 +100,11 @@ pts run --all
 # Select and run highest-value tests within a 15-second budget
 pts run --budget 15
 
-# Preview selection without executing tests or writing to SQLite
+# Preview selection without executing tests or writing runs to SQLite (uses SQLite discovery cache)
 pts run --budget 15 --dry-run --json
+
+# Force fresh `pytest --collect-only` discovery (bypassing the SQLite cache)
+pts run --budget 15 --dry-run --refresh-tests --json
 
 # Alternative selection modes
 pts run --top-k 20
@@ -184,9 +187,9 @@ max_traceback_chars = 1500
 
 | Tool | Description |
 | :--- | :--- |
-| `select_tests` | Dry-run test selection for the current working-tree diff (`budget_seconds`, `top_k`, `target_recall`). |
-| `run_fast_tests` | Select and execute tests within a budget or top-k limit, persist outcomes to `.pts/store.db`, and return structured pass/fail counts with bounded tracebacks (`budget_seconds`, `top_k`, `run_all`). |
-| `explain_selection` | Return all 16 features, active model mode, calibrated failure probability, yield score, and top contributing signals for a specific `test_id`. |
+| `select_tests` | Dry-run test selection for the current working-tree diff (`budget_seconds`, `top_k`, `target_recall`, `refresh_tests`). |
+| `run_fast_tests` | Select and execute tests within a budget or top-k limit, persist outcomes to `.pts/store.db`, and return structured pass/fail counts with bounded tracebacks (`budget_seconds`, `top_k`, `run_all`, `refresh_tests`). |
+| `explain_selection` | Return all 16 features, active model mode, calibrated failure probability, yield score, and top contributing signals for a specific `test_id` (`test_id`, `refresh_tests`). |
 
 ### Client Configuration (Stdio)
 
@@ -215,7 +218,7 @@ Add PTS to your MCP client configuration (Claude Desktop, Cursor, Claude Code, A
   - **19 failing PR runs** total (**13 failing runs** / **335 individual test failures** in the evaluation window).
   - **1,405 unique `pytest` tests** across **93,736 total outcomes** (**68,695 evaluated non-skip outcomes**).
   - **100.0% exact per-test durations** sourced directly from GitHub Actions JUnit XML (`pytest.xml`) workflow artifacts (`0.0%` estimated; 2 zero-pass environment/collection-crash runs excluded).
-- **Model cadence:** GBDT (`forust-ml`, 150 trees, depth 5) + chronological 80/20 Platt calibration retrained every 5 runs (`gbdt_steps = 58 / 58`). Full structured report saved in [`docs/benchmarks/eval_report.json`](docs/benchmarks/eval_report.json).
+- **Model cadence & evaluation setup:** GBDT (`forust-ml`, 150 trees, depth 5) + chronological Platt calibration (with minimum support guardrails of ≥5 positives across ≥2 failing runs and deterministic identity fallback) retrained every 5 runs (`gbdt_steps = 58 / 58`). Offline walk-forward evaluation runs with `explore_fraction = 0.0` so all five rankers are compared strictly on ranking + cost-aware packing quality (live CLI/MCP runs retain anti-starvation exploration). Full structured report saved in [`docs/benchmarks/eval_report.json`](docs/benchmarks/eval_report.json).
 
 ![Failure Detection Rate vs. Time Budget — PyGithub/PyGithub](docs/benchmarks/pareto_fdr_vs_budget.png)
 
@@ -223,42 +226,42 @@ Add PTS to your MCP client configuration (Claude Desktop, Cursor, Claude Code, A
 
 | Budget | Strategy | Commit FDR | Failure Recall | Time Saved | Brier Score | PR-AUC |
 | ---: | :--- | ---: | ---: | ---: | ---: | ---: |
-| **5%** | **PTS (GBDT+Platt)** | **61.5%** | **26.3%** | **98.1%** | **0.0047** | **0.4850** |
-| 5% | Heuristic | 46.2% | 5.7% | 98.7% | 0.2035 | 0.0115 |
-| 5% | StaticAst | 38.5% | 6.3% | 98.7% | 0.1424 | 0.0059 |
-| 5% | RecentFailureRate | 69.2% | 17.9% | 97.1% | 0.0042 | 0.3085 |
-| 5% | Random | 30.8% | 3.3% | 97.9% | 0.3304 | 0.0051 |
-| **10%** | **PTS (GBDT+Platt)** | **69.2%** | **50.1%** | **96.0%** | **0.0047** | **0.4850** |
-| 10% | Heuristic | 46.2% | 11.9% | 96.8% | 0.2035 | 0.0115 |
-| 10% | StaticAst | 38.5% | 9.0% | 97.0% | 0.1424 | 0.0059 |
-| 10% | RecentFailureRate | 69.2% | 30.1% | 94.8% | 0.0042 | 0.3085 |
-| 10% | Random | 38.5% | 9.0% | 95.6% | 0.3304 | 0.0051 |
-| **15%** | **PTS (GBDT+Platt)** | **76.9%** | **74.3%** | **93.9%** | **0.0047** | **0.4850** |
-| 15% | Heuristic | 76.9% | 15.2% | 94.8% | 0.2035 | 0.0115 |
-| 15% | StaticAst | 69.2% | 12.2% | 94.7% | 0.1424 | 0.0059 |
-| 15% | RecentFailureRate | 76.9% | 40.9% | 92.5% | 0.0042 | 0.3085 |
-| 15% | Random | 46.2% | 13.4% | 93.2% | 0.3304 | 0.0051 |
-| **20%** | **PTS (GBDT+Platt)** | **76.9%** | **90.1%** | **91.8%** | **0.0047** | **0.4850** |
-| 20% | Heuristic | 69.2% | 19.1% | 92.5% | 0.2035 | 0.0115 |
-| 20% | StaticAst | 69.2% | 19.1% | 92.1% | 0.1424 | 0.0059 |
-| 20% | RecentFailureRate | 76.9% | 53.4% | 89.8% | 0.0042 | 0.3085 |
-| 20% | Random | 46.2% | 17.9% | 90.8% | 0.3304 | 0.0051 |
-| **30%** | **PTS (GBDT+Platt)** | **84.6%** | **94.0%** | **87.1%** | **0.0047** | **0.4850** |
-| 30% | Heuristic | 84.6% | 22.4% | 87.8% | 0.2035 | 0.0115 |
-| 30% | StaticAst | 69.2% | 25.1% | 87.3% | 0.1424 | 0.0059 |
-| 30% | RecentFailureRate | 76.9% | 60.3% | 83.8% | 0.0042 | 0.3085 |
-| 30% | Random | 61.5% | 26.0% | 85.8% | 0.3304 | 0.0051 |
-| **50%** | **PTS (GBDT+Platt)** | **92.3%** | **96.4%** | **76.2%** | **0.0047** | **0.4850** |
-| 50% | Heuristic | 69.2% | 33.4% | 77.8% | 0.2035 | 0.0115 |
-| 50% | StaticAst | 76.9% | 36.4% | 77.9% | 0.1424 | 0.0059 |
-| 50% | RecentFailureRate | 76.9% | 66.9% | 71.1% | 0.0042 | 0.3085 |
-| 50% | Random | 61.5% | 39.1% | 75.5% | 0.3304 | 0.0051 |
+| **5%** | **PTS (GBDT+Platt)** | **53.8%** | **26.6%** | **97.6%** | **0.0040** | **0.6894** |
+| 5% | Heuristic | 46.2% | 6.3% | 98.8% | 0.2035 | 0.0115 |
+| 5% | StaticAst | 38.5% | 5.1% | 98.8% | 0.1424 | 0.0059 |
+| 5% | RecentFailureRate | 61.5% | 18.2% | 97.2% | 0.0042 | 0.3085 |
+| 5% | Random | 30.8% | 3.0% | 97.9% | 0.3304 | 0.0051 |
+| **10%** | **PTS (GBDT+Platt)** | **69.2%** | **54.6%** | **94.9%** | **0.0040** | **0.6894** |
+| 10% | Heuristic | 46.2% | 9.0% | 97.0% | 0.2035 | 0.0115 |
+| 10% | StaticAst | 38.5% | 5.4% | 97.2% | 0.1424 | 0.0059 |
+| 10% | RecentFailureRate | 69.2% | 30.1% | 94.9% | 0.0042 | 0.3085 |
+| 10% | Random | 38.5% | 7.2% | 95.7% | 0.3304 | 0.0051 |
+| **15%** | **PTS (GBDT+Platt)** | **76.9%** | **80.0%** | **92.3%** | **0.0040** | **0.6894** |
+| 15% | Heuristic | 53.8% | 12.2% | 95.0% | 0.2035 | 0.0115 |
+| 15% | StaticAst | 53.8% | 11.0% | 94.9% | 0.1424 | 0.0059 |
+| 15% | RecentFailureRate | 69.2% | 41.2% | 92.6% | 0.0042 | 0.3085 |
+| 15% | Random | 38.5% | 10.4% | 93.4% | 0.3304 | 0.0051 |
+| **20%** | **PTS (GBDT+Platt)** | **76.9%** | **93.7%** | **89.8%** | **0.0040** | **0.6894** |
+| 20% | Heuristic | 61.5% | 14.6% | 92.8% | 0.2035 | 0.0115 |
+| 20% | StaticAst | 61.5% | 15.2% | 92.3% | 0.1424 | 0.0059 |
+| 20% | RecentFailureRate | 69.2% | 52.5% | 89.8% | 0.0042 | 0.3085 |
+| 20% | Random | 38.5% | 13.4% | 91.1% | 0.3304 | 0.0051 |
+| **30%** | **PTS (GBDT+Platt)** | **76.9%** | **94.3%** | **83.6%** | **0.0040** | **0.6894** |
+| 30% | Heuristic | 69.2% | 16.7% | 88.5% | 0.2035 | 0.0115 |
+| 30% | StaticAst | 61.5% | 19.1% | 87.9% | 0.1424 | 0.0059 |
+| 30% | RecentFailureRate | 69.2% | 56.4% | 83.9% | 0.0042 | 0.3085 |
+| 30% | Random | 53.8% | 20.6% | 86.3% | 0.3304 | 0.0051 |
+| **50%** | **PTS (GBDT+Platt)** | **76.9%** | **95.5%** | **71.3%** | **0.0040** | **0.6894** |
+| 50% | Heuristic | 69.2% | 23.9% | 78.9% | 0.2035 | 0.0115 |
+| 50% | StaticAst | 69.2% | 28.1% | 79.2% | 0.1424 | 0.0059 |
+| 50% | RecentFailureRate | 69.2% | 62.7% | 70.6% | 0.0042 | 0.3085 |
+| 50% | Random | 53.8% | 30.1% | 76.2% | 0.3304 | 0.0051 |
 
-At a **20% duration budget** (**91.8% wall-clock time saved**), **PTS (GBDT+Platt)** catches **90.1%** of all individual test failures (**0.4850 PR-AUC**, **95×** Random and **+57%** over `RecentFailureRate`). At a **50% budget** (**76.2% time saved**), PTS reaches **92.3% Commit FDR** and **96.4% Failure Recall**.
+At a **20% duration budget** (**89.8% wall-clock time saved**), **PTS (GBDT+Platt)** catches **93.7%** of all individual test failures (**0.6894 PR-AUC**, **135×** Random, **60×** Heuristic, and **2.23×** `RecentFailureRate`). Every strategy's Commit FDR curve is monotonically non-decreasing across budgets.
 
 #### Probability Calibration Reliability
 
-Across all 68,695 evaluated non-skip outcomes, raw GBDT achieves a `0.0041` Brier score vs. `0.0047` after Platt scaling (both >30× better than Heuristic `0.2035` and Random `0.3304`). Notice how Platt scaling eliminates raw GBDT's overconfident high-probability tail (`[0.3, 1.0]`, where raw margins predicted 37–81% failure probability on tests with 0–8% empirical failure rates).
+Across all 68,695 evaluated non-skip outcomes, Platt calibration with the support/log-loss guardrail improves Brier score from `0.0041` (raw GBDT) to **`0.0040`** (**3.5% reduction**, lowest across all 5 strategies), while suppressing raw GBDT's overconfident `[0.3, 1.0]` tail bins.
 
 ![Probability Calibration Reliability Diagram — PyGithub/PyGithub](docs/benchmarks/calibration_reliability.png)
 
@@ -266,12 +269,20 @@ Across all 68,695 evaluated non-skip outcomes, raw GBDT achieves a `0.0041` Brie
 
 Measured on **Apple M3 Pro** (macOS arm64, `rustc 1.98.1 (48a229cea 2026-09-01)`) against [`PyGithub/PyGithub`](https://github.com/PyGithub/PyGithub) (**1,232 discovered tests**, **93,736 stored outcomes**, `model_mode = gbdt`). Raw summary in [`docs/benchmarks/systems_bench.json`](docs/benchmarks/systems_bench.json).
 
-| Metric | Value | Notes |
-| :--- | ---: | :--- |
-| Stripped release binary size (`pts`) | **8.22 MB** | Unstripped: 10.52 MB (static SQLite + `forust-ml` GBDT + Tree-sitter + `rmcp`) |
-| `pts run --budget 15 --dry-run --json` (p50 / p95) | **1,897.2 ms / 2,025.0 ms** | Cold-start CLI over 15 runs (`git diff` + `pytest --collect-only` + SQLite + AST + GBDT+Platt) |
-| `pts explain <test_id> --json` (p50 / p95) | **1,836.2 ms / 2,011.4 ms** | Cold-start CLI over 15 runs (16 features + top signals + Platt probability) |
-| Pure `pts-ml` scoring latency (1,000 tests, p50 / p95) | **1.05 ms / 1.25 ms** | **949,067 tests/sec** (150-tree GBDT + Platt calibration via `bench_infer`) |
+| Execution Path | Metric | Value | Notes |
+| :--- | :--- | ---: | :--- |
+| **Binary Footprint** | Stripped release binary (`pts`) | **8.26 MB** | Unstripped: 10.55 MB (static SQLite + `forust-ml` GBDT + Tree-sitter + `rmcp`) |
+| **Warm Rust Core** | `pts run --budget 15 --dry-run --json` (p50 / p95) | **398.3 ms / 503.1 ms** | Cached SQLite discovery (**2.2× faster** than cold; `git diff` + SQLite + AST + GBDT+Platt) |
+| **Warm Rust Core** | `pts explain <test_id> --json` (p50 / p95) | **357.2 ms / 364.6 ms** | Cached SQLite discovery (**2.4× faster** than cold; 16 features + signals + Platt prob) |
+| **Cold `pytest` Discovery** | `pts run --budget 15 --dry-run --refresh-tests --json` (p50 / p95) | **874.3 ms / 925.3 ms** | Includes external Python + `pytest --collect-only` startup across 1,232 tests |
+| **Cold `pytest` Discovery** | `pts explain <test_id> --refresh-tests --json` (p50 / p95) | **865.4 ms / 899.7 ms** | Includes external Python + `pytest --collect-only` startup |
+| **Pure ML Core** | `pts-ml` scoring latency (1,000 tests, p50 / p95) | **1.10 ms / 1.50 ms** | **905,182 tests/sec** (150-tree GBDT + Platt calibration via `bench_infer`) |
+
+#### Benchmark Notes
+
+- **Cached discovery removes the Python startup tax:** On `PyGithub/PyGithub`, spawning Python + `pytest --collect-only` adds ~500 ms of external interpreter overhead on every invocation (and up to ~1.5–2s on larger dependency graphs). Hashing test/config file metadata into SQLite `repo_meta["discovery_fingerprint"]` keeps subsequent `pts run` and `pts explain` calls entirely in Rust (`357–398 ms` p50 end-to-end, `1.10 ms` per 1,000 tests for GBDT+Platt scoring) while invalidating automatically whenever any test or pytest config file changes.
+- **Why actual wall-clock time saved exceeds `1 - budget` on fast unit suites:** The cost-aware selector enforces a `50 ms` effective duration floor (`MIN_EFF_DURATION_MS = 50.0`) so sub-millisecond tests do not receive unbounded `prob / dur` yield scores. Because `PyGithub`'s unit tests have a ~20–30 ms actual median duration, a 20% nominal budget selects fewer ultra-fast tests than `20% / 25ms`, yielding **89.8% actual wall-clock time saved** while still capturing **93.7%** of all individual test failures.
+- **Chronological calibration under extreme class imbalance (<1% failure rate):** In real CI histories where <0.5% of test executions fail, a fixed tail 20% calibration window frequently contains 0–1 failing runs and can over-compress probabilities. Expanding the calibration window backward (down to 60% train while preserving `max_train_ts < min_cal_ts`) until ≥5 positives across ≥2 failing runs are present—and falling back to identity sigmoid `(a = 1.0, b = 0.0)` when support is insufficient or log-loss does not improve—prevents probability collapse and lowers Brier score from `0.0041` to `0.0040`.
 
 ### Example `pts explain` Output (`PyGithub/PyGithub`)
 

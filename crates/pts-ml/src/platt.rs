@@ -6,6 +6,11 @@ const PLATT_TOL: f64 = 1e-7;
 const BASE_RATE_EPS: f64 = 1e-4;
 const LOGIT_EPS: f64 = 1e-12;
 
+/// Minimum positive outcomes required in `cal_set` before fitting Platt scaling.
+pub const MIN_CAL_POSITIVES: usize = 5;
+/// Minimum distinct failing runs required in `cal_set` before fitting Platt scaling.
+pub const MIN_CAL_FAILING_RUNS: usize = 2;
+
 /// Platt scaling probability calibrator:
 /// `P(y = 1 | z) = sigmoid(a * z + b)`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -15,8 +20,13 @@ pub struct PlattCalibrator {
 }
 
 impl PlattCalibrator {
-    /// Deterministic fallback calibrator used on degenerate splits or non-monotonic fits:
-    /// `a = 1.0`, `b = logit(train_base_rate.clamp(1e-4, 1.0 - 1e-4))`.
+    /// Identity sigmoid calibrator (`a = 1.0`, `b = 0.0`): preserves raw GBDT log-odds margins
+    /// without collapsing predictions to a flat base rate.
+    pub fn identity() -> Self {
+        Self { a: 1.0, b: 0.0 }
+    }
+
+    /// Legacy base-rate shift calibrator (`a = 1.0`, `b = logit(train_base_rate)`).
     pub fn fallback(train_base_rate: f64) -> Self {
         let rate = if train_base_rate.is_finite() {
             train_base_rate.clamp(BASE_RATE_EPS, 1.0 - BASE_RATE_EPS)
@@ -34,11 +44,22 @@ impl PlattCalibrator {
     /// damped 2x2 Newton-Raphson with Armijo backtracking line search.
     ///
     /// Guardrails:
-    /// - If calibration has 0 positives or 0 negatives, falls back to `Self::fallback(train_base_rate)`.
-    /// - If optimization yields `a < 0.0` or non-finite values, falls back to `Self::fallback(train_base_rate)`.
-    pub fn fit(logits: &[f64], labels: &[bool], train_base_rate: f64) -> Self {
-        if logits.len() != labels.len() || logits.is_empty() {
-            return Self::fallback(train_base_rate);
+    /// - Requires `distinct_failing_runs >= MIN_CAL_FAILING_RUNS` (2) and at least
+    ///   `MIN_CAL_POSITIVES` (5) positive outcomes plus at least 1 negative outcome.
+    /// - Rejects non-finite values, `a <= 0.0`, or any fit that does not strictly beat
+    ///   identity calibration `(a = 1.0, b = 0.0)` on unweighted `cal_set` log-loss.
+    /// - On any guardrail trigger, deterministically falls back to `Self::identity()` and
+    ///   returns `calibration_fallback = true`.
+    pub fn fit_with_guardrail(
+        logits: &[f64],
+        labels: &[bool],
+        distinct_failing_runs: usize,
+    ) -> (Self, bool) {
+        if logits.len() != labels.len()
+            || logits.is_empty()
+            || distinct_failing_runs < MIN_CAL_FAILING_RUNS
+        {
+            return (Self::identity(), true);
         }
 
         let mut pairs: Vec<(f64, bool)> = Vec::with_capacity(logits.len());
@@ -57,8 +78,8 @@ impl PlattCalibrator {
             pairs.push((z, y));
         }
 
-        if n_pos == 0 || n_neg == 0 {
-            return Self::fallback(train_base_rate);
+        if n_pos < MIN_CAL_POSITIVES || n_neg == 0 {
+            return (Self::identity(), true);
         }
 
         // Platt (1999) smoothed targets.
@@ -70,6 +91,7 @@ impl PlattCalibrator {
             .map(|&(_, y)| if y { t_pos } else { t_neg })
             .collect();
         let zs: Vec<f64> = pairs.iter().map(|&(z, _)| z).collect();
+        let ys: Vec<bool> = pairs.iter().map(|&(_, y)| y).collect();
 
         // Initialize at slope 1.0 and smoothed calibration prior intercept.
         let mut a = 1.0_f64;
@@ -79,7 +101,7 @@ impl PlattCalibrator {
         for _ in 0..PLATT_MAX_ITER {
             let (ga, gb, haa, hab, hbb) = grad_hess(&zs, &targets, a, b);
             if !ga.is_finite() || !gb.is_finite() {
-                return Self::fallback(train_base_rate);
+                return (Self::identity(), true);
             }
             if ga.abs().max(gb.abs()) < PLATT_TOL {
                 break;
@@ -100,7 +122,7 @@ impl PlattCalibrator {
                 }
                 damping = if damping == 0.0 { 1e-6 } else { damping * 10.0 };
                 if damping > 1e12 {
-                    return Self::fallback(train_base_rate);
+                    return (Self::identity(), true);
                 }
             };
 
@@ -136,12 +158,25 @@ impl PlattCalibrator {
             }
         }
 
-        // Monotonicity & numerical sanity guardrail.
-        if !a.is_finite() || !b.is_finite() || a < 0.0 {
-            return Self::fallback(train_base_rate);
+        // Strict monotonicity, finiteness, and log-loss improvement guardrail vs. identity.
+        if !a.is_finite() || !b.is_finite() || a <= 0.0 {
+            return (Self::identity(), true);
         }
 
-        Self { a, b }
+        let identity_loss = logit_log_loss(&zs, &ys, 1.0, 0.0);
+        let fitted_loss = logit_log_loss(&zs, &ys, a, b);
+        if !fitted_loss.is_finite() || fitted_loss >= identity_loss {
+            return (Self::identity(), true);
+        }
+
+        (Self { a, b }, false)
+    }
+
+    /// Convenience wrapper over `fit_with_guardrail` assuming sufficient run support when
+    /// calibrating standalone logit slices; falls back to identity `(a = 1.0, b = 0.0)` on
+    /// insufficient positive support, non-positive slope, or no log-loss gain over identity.
+    pub fn fit(logits: &[f64], labels: &[bool], _train_base_rate: f64) -> Self {
+        Self::fit_with_guardrail(logits, labels, MIN_CAL_FAILING_RUNS).0
     }
 
     /// Predicts calibrated failure probability in `(0.0, 1.0)` from a raw log-odds margin.
@@ -193,6 +228,23 @@ pub fn brier_score(probs: &[f64], labels: &[bool]) -> f64 {
         })
         .sum();
     sum_sq / (probs.len() as f64)
+}
+
+/// Computes mean binary log-loss of `sigmoid(a * z + b)` over unweighted `(logit, label)` pairs.
+pub fn logit_log_loss(logits: &[f64], labels: &[bool], a: f64, b: f64) -> f64 {
+    if logits.is_empty() || logits.len() != labels.len() {
+        return 0.0;
+    }
+    let total: f64 = logits
+        .iter()
+        .zip(labels.iter())
+        .map(|(&z, &y)| {
+            let s = a * z + b;
+            let t = if y { 1.0 } else { 0.0 };
+            softplus(s) - t * s
+        })
+        .sum();
+    total / (logits.len() as f64)
 }
 
 fn softplus(x: f64) -> f64 {
