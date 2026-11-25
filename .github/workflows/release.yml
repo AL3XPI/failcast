@@ -142,7 +142,7 @@ jobs:
       - name: Upload wheel
         uses: actions/upload-artifact@v4
         with:
-          name: wheel-${{ matrix.os }}-${{ matrix.target }}
+          name: pypi-wheels-${{ matrix.os }}-${{ matrix.target }}
           path: dist/*.whl
 
   build-sdist:
@@ -164,7 +164,7 @@ jobs:
       - name: Upload sdist
         uses: actions/upload-artifact@v4
         with:
-          name: sdist
+          name: pypi-sdist
           path: dist/*.tar.gz
 
   publish-pypi:
@@ -178,8 +178,13 @@ jobs:
       - name: Download wheels and sdist
         uses: actions/download-artifact@v4
         with:
+          pattern: pypi-*
           path: dist
           merge-multiple: true
+
+      - name: List PyPI artifacts
+        shell: bash
+        run: ls -la dist/
 
       - name: Publish to PyPI via OIDC Trusted Publishing
         uses: pypa/gh-action-pypi-publish@release/v1
