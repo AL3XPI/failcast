@@ -109,7 +109,6 @@ pub mod tests {
         fs::create_dir_all(root.join("src")).expect("mkdir src");
         fs::create_dir_all(root.join("tests")).expect("mkdir tests");
 
-        // Commit 1: initial files
         fs::write(
             root.join("src/calc.py"),
             "def add(a, b):\n    return a + b\n",
@@ -123,7 +122,6 @@ pub mod tests {
         git_cmd(root, &["add", "."], None);
         git_cmd(root, &["commit", "-m", "initial"], Some(1_700_000_100));
 
-        // Commit 2: modify src/calc.py and tests/test_calc.py
         fs::write(
             root.join("src/calc.py"),
             "def add(a, b):\n    return a + b\n\ndef sub(a, b):\n    return a - b\n",
@@ -137,7 +135,6 @@ pub mod tests {
         git_cmd(root, &["add", "."], None);
         git_cmd(root, &["commit", "-m", "add sub"], Some(1_700_000_200));
 
-        // Commit 3: modify only src/calc.py
         fs::write(
             root.join("src/calc.py"),
             "def add(a, b):\n    return a + b\n\ndef sub(a, b):\n    return a - b\n\ndef mul(a, b):\n    return a * b\n",
@@ -146,7 +143,6 @@ pub mod tests {
         git_cmd(root, &["add", "."], None);
         git_cmd(root, &["commit", "-m", "add mul"], Some(1_700_000_300));
 
-        // Uncommitted working-tree edit to src/calc.py (+3 lines, -0 lines)
         fs::write(
             root.join("src/calc.py"),
             "def add(a, b):\n    return a + b\n\ndef sub(a, b):\n    return a - b\n\ndef mul(a, b):\n    return a * b\n\ndef div(a, b):\n    return a / b\n",
@@ -156,7 +152,6 @@ pub mod tests {
         let commits = mine_commit_history(root, 10).expect("mine commit history");
         assert_eq!(commits.len(), 3, "expected exactly 3 commits");
 
-        // `git log` returns newest first.
         let expected_author = hash_author("tester@example.com");
         assert_eq!(commits[0].commit_ts, 1_700_000_300);
         assert_eq!(commits[0].author_hash, expected_author);
@@ -173,7 +168,6 @@ pub mod tests {
         assert_eq!(commits[2].parent_sha, None);
         assert_eq!(commits[2].files_changed, 2);
 
-        // Verify file churn across mined commits: src/calc.py touched 3x, tests/test_calc.py 2x.
         let calc_churn = commits
             .iter()
             .filter(|c| c.files.iter().any(|f| f.path == "src/calc.py"))
@@ -185,7 +179,6 @@ pub mod tests {
         assert_eq!(calc_churn, 3);
         assert_eq!(test_churn, 2);
 
-        // Verify working-tree diff.
         let diff = extract_working_diff(root).expect("extract working diff");
         assert_eq!(diff.base_commit, Some(commits[0].commit_sha.clone()));
         assert_eq!(diff.files.len(), 1);

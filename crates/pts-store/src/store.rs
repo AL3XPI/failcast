@@ -800,7 +800,6 @@ impl Store {
             ..HistorySnapshot::default()
         };
 
-        // 1. Chronological per-test outcomes strictly prior to as_of_ts.
         struct TestAcc {
             total_runs: u64,
             total_failures: u64,
@@ -809,7 +808,7 @@ impl Store {
             runs_since_last_fail: Option<u64>,
             durations: Vec<u64>,
             last_run_ts: Option<i64>,
-            fp_flags: BTreeMap<String, (bool, bool)>, // (has_pass, has_fail)
+            fp_flags: BTreeMap<String, (bool, bool)>,
         }
 
         let mut accs: BTreeMap<String, TestAcc> = BTreeMap::new();
@@ -925,7 +924,6 @@ impl Store {
             );
         }
 
-        // 2. Historical co-failure counts strictly prior to as_of_ts.
         match diff_paths {
             Some([]) => {
                 // Empty working diff: no co-failure pairs will be queried by feature extraction.
@@ -1016,7 +1014,6 @@ impl Store {
             }
         }
 
-        // 3. Git co-change frequencies & 30-day file churn strictly prior to as_of_ts.
         {
             let cutoff_30d = as_of_ts.saturating_sub(SECONDS_PER_30_DAYS);
             let mut stmt = self

@@ -40,8 +40,8 @@ pub const FEATURE_NAMES: [&str; NUM_FEATURES] = [
     "touched_file_churn_30d",
 ];
 
-/// Pure feature extraction implementing all 16 features from SPEC.md Section 5.1
-/// in exact index order. Undefined or missing values are encoded as `f64::NAN`.
+/// Extracts the 16-feature vector in canonical index order.
+/// Missing or undefined values are encoded as `f64::NAN`.
 pub fn extract_features(
     test: &TestCase,
     diff: &DiffSummary,

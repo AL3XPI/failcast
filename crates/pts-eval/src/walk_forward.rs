@@ -192,7 +192,6 @@ pub fn walk_forward_eval(
         acc.record_run(run);
     }
 
-    // Accumulators indexed by [budget_idx][strategy_idx].
     let mut metrics_grid: Vec<[MetricsAccumulator; 5]> = config
         .budget_fractions
         .iter()
@@ -226,7 +225,6 @@ pub fn walk_forward_eval(
             group_end += 1;
         }
 
-        // Strict training slice: ONLY runs with `started_at < eval_ts`.
         let train_slice = &sorted_runs[..i];
         let max_prior_ts = train_slice
             .iter()
@@ -271,7 +269,6 @@ pub fn walk_forward_eval(
             );
         }
 
-        // Strictly prior history snapshot for all runs at `eval_ts`.
         let snapshot = acc.snapshot(eval_ts);
 
         for eval_run in &sorted_runs[i..group_end] {
@@ -337,7 +334,6 @@ pub fn walk_forward_eval(
                 failing_runs += 1;
             }
 
-            // Score all 5 strategies on this run's non-skip tests.
             let heuristic_probs: Vec<f64> = feature_rows.iter().map(score_heuristic).collect();
             let (pts_probs, raw_gbdt_probs): (Vec<f64>, Vec<f64>) = match &current_model {
                 Some(model) => {

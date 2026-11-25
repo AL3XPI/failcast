@@ -81,7 +81,6 @@ pub fn parse_junit_xml(
                     }
                     b"error" => {
                         if let Some(tc) = current.as_mut() {
-                            // Prefer Fail if already marked Fail, otherwise Error.
                             if tc.status != Some(TestStatus::Fail) {
                                 tc.status = Some(TestStatus::Error);
                             }

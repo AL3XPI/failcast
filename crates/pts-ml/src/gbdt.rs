@@ -16,7 +16,7 @@ const MIN_TRAIN_RUN_FRACTION: f64 = 0.60;
 /// raw log-odds margins (`base_score + sum(tree_outputs)`), not sigmoid probabilities.
 pub const BOOSTER_PREDICTS_RAW_MARGINS: bool = true;
 
-/// SPEC.md Section 5.3 v1 GBDT hyperparameters.
+/// Default GBDT training hyperparameters.
 pub const GBDT_SEED: u64 = 42;
 pub const GBDT_ITERATIONS: usize = 150;
 pub const GBDT_LEARNING_RATE: f32 = 0.05;
@@ -98,7 +98,6 @@ pub fn build_chronological_split(
         neg_count: usize,
     }
 
-    // Collect distinct runs present in the non-skip dataset in chronological order.
     let mut run_order: Vec<RunStats> = Vec::new();
     for row in &dataset {
         let is_pos = row.label >= 0.5;
@@ -138,7 +137,6 @@ pub fn build_chronological_split(
     {
         target_train
     } else {
-        // Try moving right past the timestamp tie group.
         let mut right = target_train;
         while right < total_runs
             && run_order[right].started_at == run_order[target_train - 1].started_at
@@ -148,7 +146,6 @@ pub fn build_chronological_split(
         if right < total_runs {
             right
         } else {
-            // Otherwise move left before the timestamp tie group.
             let mut left = target_train;
             while left > 0 && run_order[left - 1].started_at == run_order[target_train].started_at {
                 left -= 1;
@@ -359,7 +356,7 @@ pub struct TrainResult {
     pub calibrated_brier: f64,
 }
 
-/// Builds a configured `forust-ml` `GradientBooster` with SPEC.md Section 5.3 defaults.
+/// Builds a configured `forust-ml` `GradientBooster` with default hyperparameters.
 pub fn build_default_booster() -> GradientBooster {
     GradientBooster::default()
         .set_objective_type(ObjectiveType::LogLoss)
@@ -411,7 +408,6 @@ pub fn train_gbdt_model(
         .fit(&train_matrix, &train_labels, &train_weights, None)
         .map_err(|e| PtsError::InvalidInput(format!("forust-ml training failed: {e}")))?;
 
-    // Calibrate on unweighted chronological holdout runs.
     let cal_features: Vec<[f64; NUM_FEATURES]> =
         split.cal_rows.iter().map(|r| r.features).collect();
     let cal_labels_bool: Vec<bool> = split.cal_rows.iter().map(|r| r.label >= 0.5).collect();

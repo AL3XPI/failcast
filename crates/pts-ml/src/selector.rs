@@ -1,7 +1,8 @@
 use pts_core::{Config, SelectionReason};
 use serde::{Deserialize, Serialize};
 
-/// Minimum effective test duration floor in milliseconds (SPEC.md Section 5.5).
+/// Minimum effective test duration floor in milliseconds.
+/// Clamping prevents sub-millisecond tests from dominating `prob / eff_ms` yield ratios.
 pub const MIN_EFF_DURATION_MS: f64 = 50.0;
 
 /// Fallback per-test duration estimate in milliseconds when a repository has no timing history.
@@ -87,7 +88,7 @@ fn seed_from_fingerprint(diff_fingerprint: &str) -> u64 {
     u64::from_be_bytes(bytes)
 }
 
-/// Pure, deterministic cost-aware test selector implementing SPEC.md Section 5.5.
+/// Pure, deterministic cost-aware test selector.
 /// All score ties are broken lexicographically by `test_id` ascending.
 pub fn select_tests(
     candidates: &[CandidateTest],
@@ -164,7 +165,6 @@ fn select_budget(
     let explore_budget_ms = (budget_ms as f64 * frac) as u64;
     let exploit_budget_ms = budget_ms.saturating_sub(explore_budget_ms);
 
-    // 1. Exploit pass: sort by yield (prob / eff_ms) descending, tie-break by test_id ascending.
     candidates.sort_by(|a, b| {
         b.yield_score
             .total_cmp(&a.yield_score)
@@ -191,7 +191,6 @@ fn select_budget(
         }
     }
 
-    // 2. Explore pass: deterministic SplitMix64 staleness-weighted sampling without replacement.
     if explore_budget_ms == 0 || unselected.is_empty() {
         return selected;
     }
@@ -301,7 +300,6 @@ fn select_target_recall(
             .then_with(|| a.test_id.cmp(&b.test_id))
     });
 
-    // Precompute suffix product of (1 - p_j) for j >= i.
     let n = candidates.len();
     let mut suffix_pass = vec![1.0_f64; n + 1];
     for i in (0..n).rev() {

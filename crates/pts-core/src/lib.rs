@@ -20,7 +20,6 @@ pub mod tests {
     fn config_defaults_and_toml_override() {
         let dir = tempfile::tempdir().expect("tempdir");
 
-        // When .pts.toml is absent, defaults are returned.
         let default_cfg = Config::load(dir.path()).expect("load default config");
         assert_eq!(default_cfg, Config::default());
         assert_eq!(default_cfg.runner, "pytest");
@@ -32,7 +31,6 @@ pub mod tests {
         assert_eq!(default_cfg.pytest_bin, "pytest");
         assert_eq!(default_cfg.max_traceback_chars, 1500);
 
-        // Partial TOML overrides only specified keys.
         let toml_content = r#"
 default_budget_secs = 42
 pytest_bin = "/usr/local/bin/pytest"
@@ -44,7 +42,6 @@ max_traceback_chars = 800
         assert_eq!(overridden.default_budget_secs, 42);
         assert_eq!(overridden.pytest_bin, "/usr/local/bin/pytest");
         assert_eq!(overridden.max_traceback_chars, 800);
-        // Unspecified keys remain defaults.
         assert_eq!(overridden.runner, "pytest");
         assert!((overridden.explore_fraction - 0.10).abs() < f64::EPSILON);
         assert_eq!(overridden.min_failures_for_ml, 25);

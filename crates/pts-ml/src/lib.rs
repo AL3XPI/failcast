@@ -1,7 +1,7 @@
 //! Pure feature engineering, cold-start heuristic ranker, GBDT trainer, Platt calibrator,
 //! and cost-aware selector.
 //!
-//! Invariant 2: This crate is 100% pure — no disk I/O, no subprocesses, no DB,
+//! This crate is 100% pure: no disk I/O, no subprocesses, no DB,
 //! and no `SystemTime::now()` calls.
 
 pub mod accumulator;
@@ -105,7 +105,6 @@ pub mod tests {
             .file_churn_30d
             .insert("tests/test_other.py".to_string(), 2);
 
-        // Case 1: Seen test with reachable AST hop = 1.
         let seen_test = TestCase {
             test_id: "tests/test_auth.py::test_refresh".to_string(),
             file_path: "tests/test_auth.py".to_string(),
@@ -116,9 +115,7 @@ pub mod tests {
         assert!((f_seen[IDX_DIRECT_TEST_MODIFIED] - 0.0).abs() < 1e-12);
         assert!((f_seen[IDX_PATH_JACCARD_MAX] - 0.5).abs() < 1e-12);
         assert!((f_seen[IDX_SAME_DIR_OVERLAP] - 1.0).abs() < 1e-12);
-        // Laplace smoothed: (3 + 0.5) / (5 + 5.0) = 0.35
         assert!((f_seen[IDX_COFAIL_RATE_MAX] - 0.35).abs() < 1e-12);
-        // Co-change: 3 / 4 = 0.75
         assert!((f_seen[IDX_COCHANGE_FREQ_MAX] - 0.75).abs() < 1e-12);
         assert!((f_seen[IDX_EWMA_FAIL_10] - 0.32).abs() < 1e-12);
         assert!((f_seen[IDX_EWMA_FAIL_50] - 0.11).abs() < 1e-12);
@@ -131,7 +128,6 @@ pub mod tests {
         assert!((f_seen[IDX_DIFF_TOP_DIRS_COUNT] - 2.0).abs() < 1e-12);
         assert!((f_seen[IDX_TOUCHED_FILE_CHURN_30D] - 7.0).abs() < 1e-12);
 
-        // Case 2: Unseen test with unreachable AST hop (None) -> NAN in indices 0, 8, 10.
         let unseen_test = TestCase {
             test_id: "unit/test_brand_new.py::test_new".to_string(),
             file_path: "unit/test_brand_new.py".to_string(),
@@ -144,7 +140,6 @@ pub mod tests {
         assert!((f_unseen[IDX_DIRECT_TEST_MODIFIED] - 0.0).abs() < 1e-12);
         assert!((f_unseen[IDX_PATH_JACCARD_MAX] - 0.0).abs() < 1e-12);
         assert!((f_unseen[IDX_SAME_DIR_OVERLAP] - 0.0).abs() < 1e-12);
-        // Unseen co-failure Laplace prior: (0 + 0.5) / (0 + 5.0) = 0.1
         assert!((f_unseen[IDX_COFAIL_RATE_MAX] - 0.1).abs() < 1e-12);
         assert!((f_unseen[IDX_COCHANGE_FREQ_MAX] - 0.0).abs() < 1e-12);
         assert!((f_unseen[IDX_EWMA_FAIL_10] - 0.0).abs() < 1e-12);
@@ -164,7 +159,6 @@ pub mod tests {
         assert!((f_unseen[IDX_DIFF_TOP_DIRS_COUNT] - 2.0).abs() < 1e-12);
         assert!((f_unseen[IDX_TOUCHED_FILE_CHURN_30D] - 7.0).abs() < 1e-12);
 
-        // Verify heuristic ranker produces strictly higher score for directly-related seen test.
         let p_seen = score_heuristic(&f_seen);
         let p_unseen = score_heuristic(&f_unseen);
         assert!(p_seen > 0.0 && p_seen < 1.0);
@@ -175,14 +169,10 @@ pub mod tests {
     #[test]
     fn selector_respects_budget_explores_and_is_deterministic() {
         let config = Config {
-            explore_fraction: 0.25, // 250ms explore, 750ms exploit out of 1000ms budget
+            explore_fraction: 0.25,
             ..Config::default()
         };
 
-        // `test_fast_high_yield`: prob=0.70, dur=100ms -> yield = 0.0070
-        // `test_slow_higher_prob`: prob=0.80, dur=800ms -> yield = 0.0010 (won't fit exploit after fast)
-        // `test_medium`: prob=0.50, dur=500ms -> yield = 0.0010 (fits exploit: 100 + 500 = 600 <= 750)
-        // `test_stale_a`, `test_stale_b`: dur=100ms, low prob -> eligible for explore (250ms budget)
         let candidates = vec![
             CandidateTest {
                 test_id: "tests/test_suite.py::test_slow_higher_prob".to_string(),
@@ -234,7 +224,6 @@ pub mod tests {
             SelectionReason::Heuristic,
         );
 
-        // Repeat with reversed input order to verify full determinism regardless of input ordering.
         let mut reversed = candidates.clone();
         reversed.reverse();
         let run2 = select_tests(
@@ -252,26 +241,22 @@ pub mod tests {
             "selection output must be byte-for-byte deterministic"
         );
 
-        // First selected test MUST be the high-yield fast test, NOT the slow slightly-higher-prob test.
         assert_eq!(run1[0].test_id, "tests/test_suite.py::test_fast_high_yield");
         assert_eq!(run1[0].selection_reason, SelectionReason::Heuristic);
         assert!((run1[0].sampling_propensity - 1.0).abs() < 1e-12);
 
-        // Slow 800ms test must NOT be selected in exploit (exceeds remaining exploit budget).
         assert!(
             !run1
                 .iter()
                 .any(|s| s.test_id == "tests/test_suite.py::test_slow_higher_prob")
         );
 
-        // Total estimated duration must stay within 1000ms budget.
         let total_ms: u64 = run1.iter().map(|s| s.est_duration_ms).sum();
         assert!(
             total_ms <= 1000,
             "total est duration {total_ms}ms exceeded 1000ms budget"
         );
 
-        // Explore pass must allocate tests with SelectionReason::Explore and valid sampling_propensity.
         let explored: Vec<&SelectedTest> = run1
             .iter()
             .filter(|s| s.selection_reason == SelectionReason::Explore)
@@ -286,7 +271,6 @@ pub mod tests {
                 "propensity {} out of bounds",
                 item.sampling_propensity
             );
-            // With 3 eligible stale candidates on first draw, propensity must be < 1.0.
             assert!(item.sampling_propensity < 1.0 || run1.len() >= 4);
         }
     }
@@ -298,13 +282,13 @@ pub mod tests {
             CandidateTest {
                 test_id: "tests/test_b.py::test_2".to_string(),
                 prob: 0.5,
-                est_duration_ms: Some(10.0), // floored to 50ms
+                est_duration_ms: Some(10.0),
                 days_since_last_run: 0.0,
             },
             CandidateTest {
                 test_id: "tests/test_a.py::test_1".to_string(),
                 prob: 0.5,
-                est_duration_ms: Some(10.0), // floored to 50ms -> exact yield tie with test_b
+                est_duration_ms: Some(10.0),
                 days_since_last_run: 0.0,
             },
             CandidateTest {
@@ -315,7 +299,6 @@ pub mod tests {
             },
         ];
 
-        // Top-K breaks ties lexicographically by test_id.
         let top1 = select_tests(
             &candidates,
             SelectionStrategy::TopK { k: 1 },
@@ -328,10 +311,6 @@ pub mod tests {
         assert_eq!(top1[0].test_id, "tests/test_a.py::test_1");
         assert_eq!(top1[0].est_duration_ms, 50);
 
-        // Target-Recall 0.90:
-        // unselected [0.5, 0.5, 0.05] -> miss=0.7625 > 0.10 (pick test_a)
-        // unselected [0.5, 0.05] -> miss=0.525 > 0.10 (pick test_b)
-        // unselected [0.05] -> miss=0.05 <= 0.10 (stop!)
         let recall_sel = select_tests(
             &candidates,
             SelectionStrategy::TargetRecall {
@@ -401,7 +380,6 @@ pub mod tests {
 
     #[test]
     fn column_major_layout_and_booster_determinism() {
-        // 1. Verify to_column_major exact indexing: out[col * num_rows + row] == rows[row][col].
         let mut row0 = [0.0; NUM_FEATURES];
         let mut row1 = [0.0; NUM_FEATURES];
         let mut row2 = [0.0; NUM_FEATURES];
@@ -428,7 +406,6 @@ pub mod tests {
             }
         }
 
-        // 2. Verify forust-ml LogLoss booster outputs raw log-odds margins (values < 0.0 and > 1.0).
         let runs = make_synthetic_runs(30);
         let res1 = train_gbdt_model(&runs, &[], 1_700_500_000).expect("first training");
         let res2 = train_gbdt_model(&runs, &[], 1_700_500_000).expect("second training");
@@ -450,7 +427,6 @@ pub mod tests {
             "expected raw log-odds margins outside [0, 1] probability range"
         );
 
-        // 3. Confirm bit-identical predictions and serialized artifacts across two trainings.
         let probs1 = res1.model.predict_probs(&probe_rows);
         let probs2 = res2.model.predict_probs(&probe_rows);
         assert_eq!(probs1.len(), probs2.len());
@@ -470,7 +446,6 @@ pub mod tests {
             "serialized ModelArtifact must be bit-identical"
         );
 
-        // 4. Confirm deserialized model reproduces bit-identical predictions.
         let reloaded = TrainedModel::from_json(&json1).expect("deserialize artifact");
         let probs_reloaded = reloaded.predict_probs(&probe_rows);
         for (&p1, &pr) in probs1.iter().zip(probs_reloaded.iter()) {
@@ -480,14 +455,11 @@ pub mod tests {
 
     #[test]
     fn platt_calibrator_improves_brier_and_handles_degenerate_splits() {
-        // 1. Construct uncalibrated, overconfident, shifted synthetic logits:
-        //    true p = sigmoid(x), but raw model outputs z = 3.0 * x + 2.0.
         let mut raw_logits = Vec::new();
         let mut labels = Vec::new();
         for i in 0..200 {
             let x = -3.0 + 6.0 * (i as f64) / 199.0;
             let true_p = sigmoid(x);
-            // Deterministic stratified pseudo-sampling matching true_p.
             let threshold = ((i * 37 + 13) % 100) as f64 / 100.0;
             let y = threshold < true_p;
             raw_logits.push(3.0 * x + 2.0);
@@ -512,7 +484,6 @@ pub mod tests {
             "Platt calibration must lower Brier score: cal={cal_brier:.6} vs raw={raw_brier:.6}"
         );
 
-        // 2. Inverted logits (where unconstrained slope would be negative) must fall back to identity (a=1, b=0).
         let inverted_logits: Vec<f64> = vec![-3.0, -2.5, -2.0, -1.5, -1.0, 1.0, 1.5, 2.0, 2.5, 3.0];
         let inverted_labels: Vec<bool> = vec![
             true, true, true, true, true, false, false, false, false, false,
@@ -522,7 +493,6 @@ pub mod tests {
         assert!((inv_cal.a - 1.0).abs() < 1e-12);
         assert!((inv_cal.b - 0.0).abs() < 1e-12);
 
-        // 3. Degenerate 0-positive and 0-negative calibration splits must fall back deterministically to identity without NaN.
         let zero_pos =
             PlattCalibrator::fit(&[-1.0, 0.0, 1.0, 2.0], &[false, false, false, false], 0.15);
         assert!((zero_pos.a - 1.0).abs() < 1e-12);
@@ -539,7 +509,6 @@ pub mod tests {
     fn platt_expands_cal_window_and_falls_back_to_identity() {
         use pts_core::{DiffFile, DiffSummary, HistoricalOutcome, HistoricalRun, TestStatus};
 
-        // Helper to build N chronological runs where specified run indices have `fail_count` failures.
         let build_runs =
             |total_runs: usize, failing_map: &[(usize, usize)]| -> Vec<HistoricalRun> {
                 let mut runs = Vec::with_capacity(total_runs);
@@ -583,10 +552,6 @@ pub mod tests {
                 runs
             };
 
-        // Case 1: 20 runs total -> default 80/20 split is runs[0..16] train, runs[16..20] cal.
-        // Put only 1 failing run in tail 20% (run 18, 3 fails) and a 2nd failing run at run 14 (3 fails)
-        // plus training failures at runs 2 and 5. The splitter must expand cal_set backward to include
-        // run 14 (split_idx = 14, >= 60% = 12) while strictly preserving max_train_ts < min_cal_ts.
         let runs_expand = build_runs(20, &[(2, 3), (5, 3), (14, 3), (18, 3)]);
         let split = build_chronological_split(&runs_expand, &[]).expect("expanded split");
         assert!(
@@ -598,8 +563,6 @@ pub mod tests {
         assert_eq!(split.cal_failing_runs, 2);
         assert_eq!(split.cal_positives, 6);
 
-        // Case 2: Insufficient support even down to 60% (only 1 failing run in runs[12..20]).
-        // Training must succeed and deterministically fall back to identity sigmoid (a=1.0, b=0.0).
         let runs_sparse = build_runs(20, &[(2, 4), (5, 4), (18, 3)]);
         let trained_sparse =
             train_gbdt_model(&runs_sparse, &[], 1_730_000_000).expect("train sparse");
@@ -611,31 +574,26 @@ pub mod tests {
         assert!((trained_sparse.model.artifact.platt_a - 1.0).abs() < 1e-12);
         assert!((trained_sparse.model.artifact.platt_b - 0.0).abs() < 1e-12);
 
-        // Case 3: Perfectly calibrated logits where fitted Platt cannot strictly improve log-loss
-        // over identity (a=1.0, b=0.0) must trigger identity fallback.
         let mut cal_logits = Vec::new();
         let mut cal_labels = Vec::new();
         for _ in 0..10 {
-            cal_logits.push(2.197_224_577); // sigmoid ~= 0.9
+            cal_logits.push(2.197_224_577);
             cal_labels.push(true);
         }
         cal_logits.push(2.197_224_577);
         cal_labels.push(false);
         for _ in 0..10 {
-            cal_logits.push(-2.197_224_577); // sigmoid ~= 0.1
+            cal_logits.push(-2.197_224_577);
             cal_labels.push(false);
         }
         cal_logits.push(-2.197_224_577);
         cal_labels.push(true);
-        // Check guardrail directly: if Platt doesn't beat identity log-loss, fallback is true;
-        // and if distinct_failing_runs < 2, fallback is always true.
         let (cal_low_runs, fb_low_runs) =
             PlattCalibrator::fit_with_guardrail(&cal_logits, &cal_labels, 1);
         assert!(fb_low_runs);
         assert!((cal_low_runs.a - 1.0).abs() < 1e-12);
         assert!((cal_low_runs.b - 0.0).abs() < 1e-12);
 
-        // Inverted logits with sufficient support also fail log-loss & slope guardrail -> identity fallback.
         let inv_logits = [-3.0, -2.5, -2.0, -1.5, -1.0, 1.0, 1.5, 2.0, 2.5, 3.0];
         let inv_labels = [
             true, true, true, true, true, false, false, false, false, false,
@@ -645,7 +603,6 @@ pub mod tests {
         assert!((cal_inv.a - 1.0).abs() < 1e-12);
         assert!((cal_inv.b - 0.0).abs() < 1e-12);
 
-        // Case 4: Backwards-compatible ModelArtifact deserialization when calibration_fallback is omitted.
         let mut artifact_val: serde_json::Value =
             serde_json::to_value(&trained_sparse.model.artifact).expect("to_value");
         artifact_val
@@ -664,7 +621,6 @@ pub mod tests {
         use pts_core::{CommitRecord, DiffFile, RunMode, TestStatus};
         use pts_store::{RunRecord, Store, TestOutcomeRecord};
 
-        // 1. Verify strict chronological 80/20 split with zero run overlap and skip exclusion.
         let runs = make_synthetic_runs(25);
         let split = build_chronological_split(&runs, &[]).expect("build chronological split");
 
@@ -696,7 +652,6 @@ pub mod tests {
         );
         assert_eq!(train_run_ids.len() + cal_run_ids.len(), runs.len());
 
-        // Verify skipped outcomes were excluded.
         let expected_non_skip: usize = runs
             .iter()
             .flat_map(|r| r.outcomes.iter())
@@ -707,7 +662,6 @@ pub mod tests {
             expected_non_skip
         );
 
-        // 2. Verify HistoryAccumulator matches Store::load_history_snapshot at an intermediate cutoff.
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("store.db");
         let mut store = Store::open(&db_path).expect("open store");

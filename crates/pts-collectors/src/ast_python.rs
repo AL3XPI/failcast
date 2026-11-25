@@ -388,7 +388,6 @@ fn resolve_import(
             } else {
                 // PEP 328 relative import resolution from current file's package directory.
                 let mut dir_parts: Vec<&str> = current_file.split('/').collect();
-                // Drop filename to obtain the enclosing package directory.
                 dir_parts.pop();
 
                 let ascents = relative_level.saturating_sub(1);

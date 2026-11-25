@@ -198,7 +198,7 @@ pub struct ContributingSignal {
     pub description: String,
 }
 
-/// Detailed score & 16-feature explanation for a single test, matching SPEC.md Section 6.2.
+/// Detailed score and 16-feature explanation for a single test.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ExplainReport {
     pub test_id: String,
@@ -356,7 +356,7 @@ pub fn select_for_working_tree(
 }
 
 /// Selects and executes tests for the current working tree, persisting all outcomes to `.pts/store.db`
-/// before returning (Invariant 6: Persist Before Exit).
+/// before returning.
 pub fn run_selected_tests(
     repo_root: &Path,
     request: SelectionRequest,
@@ -458,7 +458,7 @@ pub fn run_selected_tests(
         })
         .collect();
 
-    // Invariant 6: Persist outcomes BEFORE returning report / exit code.
+    // Persist outcomes before returning so failing test runs still record history.
     store.persist_run_with_outcomes(
         &run_record,
         &plan.diff.files,

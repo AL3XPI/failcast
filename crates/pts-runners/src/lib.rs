@@ -102,7 +102,6 @@ pub mod tests {
             assert!(!tc.test_id.contains('\\'));
         }
 
-        // Execute full suite with PTS_FIXTURE_FAIL=1.
         let failing_runner = PytestRunner::default().with_env("PTS_FIXTURE_FAIL", "1");
         let fail_res = failing_runner
             .execute(&fixture, None)
@@ -143,7 +142,6 @@ pub mod tests {
             "failed outcome must have non-empty failure_message"
         );
 
-        // Execute a single selected test.
         let selected = vec!["tests/test_calc.py::test_add_positive".to_string()];
         let single_res = runner
             .execute(&fixture, Some(&selected))
@@ -159,8 +157,6 @@ pub mod tests {
 
     #[test]
     fn junit_parses_class_and_parametrized_node_ids() {
-        // 1. Pure JUnit XML coverage across legacy (`file` attr), xunit2 (no `file` attr),
-        //    stripped module prefix, nested classes, Windows paths, and parametrized tests.
         let xml = r#"<?xml version="1.0" encoding="utf-8"?>
 <testsuites>
   <testsuite name="pytest" tests="7">
@@ -189,7 +185,6 @@ pub mod tests {
             ]
         );
 
-        // 2. End-to-end parity check against real `pytest --collect-only` and `pytest --junitxml`.
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(dir.path().join("tests")).expect("mkdir tests");
         std::fs::write(

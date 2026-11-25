@@ -5,7 +5,7 @@ use pts_cli::cli::{self, Cli};
 use tracing_subscriber::EnvFilter;
 
 fn main() -> ExitCode {
-    // Invariant 5: All tracing logs and warnings MUST route strictly to stderr.
+    // Route all tracing logs to stderr so stdout stays clean for JSON and MCP framing.
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(

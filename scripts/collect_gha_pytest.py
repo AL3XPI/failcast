@@ -126,7 +126,6 @@ def junit_testcase_to_test_id(classname: str, name: str, file_attr: str = "") ->
     if classname.strip():
         parts = [p for p in classname.strip().split(".") if p]
         if file_path:
-            # Determine class segments that aren't part of the module path.
             mod_stem = file_path[:-3] if file_path.endswith(".py") else file_path
             mod_parts = [p for p in mod_stem.split("/") if p]
             if len(parts) > len(mod_parts) and parts[: len(mod_parts)] == mod_parts:
@@ -280,7 +279,6 @@ def parse_pytest_log(log_text: str) -> ParsedOutcomes:
         if not line:
             continue
 
-        # 1. Check verbose per-test lines (standard or xdist).
         m = PYTEST_VERBOSE_RE.match(line) or PYTEST_XDIST_RE.match(line)
         if m:
             verbose_line_count += 1
@@ -291,7 +289,6 @@ def parse_pytest_log(log_text: str) -> ParsedOutcomes:
                 statuses[nodeid] = status
             continue
 
-        # 2. Check --durations lines (sum setup + call + teardown per nodeid).
         dm = PYTEST_DURATION_RE.match(line)
         if dm:
             nodeid = normalize_posix_path(dm.group("nodeid"))
@@ -300,7 +297,6 @@ def parse_pytest_log(log_text: str) -> ParsedOutcomes:
             durations_ms[nodeid] = durations_ms.get(nodeid, 0) + ms
             continue
 
-        # 3. Check short test summary info lines for failure excerpts (and any missed failures).
         sm = PYTEST_SUMMARY_FAIL_RE.match(line)
         if sm:
             nodeid = normalize_posix_path(sm.group("nodeid"))
@@ -311,7 +307,6 @@ def parse_pytest_log(log_text: str) -> ParsedOutcomes:
                 excerpts[nodeid] = msg.strip()[:MAX_FAILURE_EXCERPT_CHARS]
             continue
 
-        # 4. Capture total suite wall-clock duration for fallback per-test estimate.
         tm = PYTEST_TOTAL_TIME_RE.search(line)
         if tm:
             try:
@@ -623,7 +618,6 @@ class GhApiClient:
             )
             return (fail_match, is_pytest_like - non_test, is_stable_linux)
 
-        # Filter to matching-conclusion test jobs first so we don't fetch logs for passing/lint jobs.
         if prefer_failed:
             candidate_jobs = [
                 j
@@ -647,7 +641,6 @@ class GhApiClient:
         ranked_jobs = sorted(candidate_jobs, key=job_rank, reverse=True)
         best_parsed: Optional[ParsedOutcomes] = None
 
-        # Try up to 3 top-ranked jobs to find one with verbose pytest test outcomes.
         for job in ranked_jobs[:3]:
             job_id = job.get("id")
             if not job_id:
@@ -859,7 +852,6 @@ def collect_runs(
             "source": parsed.source,
         }
 
-    # Phase 1: Collect failing pytest PR runs.
     for idx, run in enumerate(failed_pool):
         if failing_runs_written >= target_failures or len(collected_records) >= max_runs:
             break
@@ -890,10 +882,8 @@ def collect_runs(
             flush=True,
         )
 
-    # Phase 2: Fill remaining slots with passing PR runs spread across the timeline.
     remaining_slots = max_runs - len(collected_records)
     if remaining_slots > 0 and passed_pool:
-        # Subsample passed_pool evenly across time if pool is larger than needed.
         stride = max(1, len(passed_pool) // (remaining_slots * 2)) if len(passed_pool) > remaining_slots * 2 else 1
         ordered_passed = passed_pool[::stride] + [
             r for i, r in enumerate(passed_pool) if i % stride != 0
@@ -928,7 +918,6 @@ def collect_runs(
                     flush=True,
                 )
 
-    # Sort strictly ascending by started_at (and run_id tie-breaker) for PTS chronological ingestion.
     collected_records.sort(key=lambda r: (r["started_at"], r["run_id"]))
 
     out_path.parent.mkdir(parents=True, exist_ok=True)

@@ -49,7 +49,6 @@ pub struct HistoryAccumulator {
     tests: BTreeMap<String, TestAcc>,
     cofail_counts: BTreeMap<(String, String), CoFailCounts>,
 
-    // Git commits sorted ascending by (commit_ts, commit_sha) and streaming cursor.
     commits: Vec<CommitRecord>,
     next_commit_idx: usize,
     file_commit_counts: BTreeMap<String, u32>,

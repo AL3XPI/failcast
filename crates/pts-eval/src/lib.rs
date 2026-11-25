@@ -41,11 +41,6 @@ pub mod tests {
 
     #[test]
     fn walk_forward_beats_random_on_synthetic_history() {
-        // Generate deterministic 60-run synthetic repo history across 5 modules x 4 tests = 20 tests.
-        // Realistic couplings:
-        // - Each module `src/mod_k.py` is imported by `tests/test_mod_k.py` (ast_min_hop = 1).
-        // - Hidden cross-module co-failure: modifying `src/mod_4.py` also breaks `tests/test_mod_0.py::test_2`.
-        // - ~1.5% flaky noise across all tests.
         let mut rng = TestRng::new(20250101);
         let num_runs = 60usize;
         let num_modules = 5usize;
@@ -57,7 +52,7 @@ pub mod tests {
         for r in 0..num_runs {
             let ts = 1_700_000_000 + (r as i64) * 3600;
             let touched_mod = (rng.next_u64() as usize) % num_modules;
-            let is_regression = r % 3 != 0; // ~67% of commits introduce a targeted regression
+            let is_regression = r % 3 != 0;
             let diff_file = format!("src/mod_{touched_mod}.py");
             let mut diff_files = vec![DiffFile {
                 path: diff_file.clone(),
@@ -102,15 +97,13 @@ pub mod tests {
 
                 for t in 0..tests_per_module {
                     let test_id = format!("{file_path}::test_{t}");
-                    let mut fail_prob = 0.01; // flaky baseline noise
+                    let mut fail_prob = 0.01;
                     if is_regression {
-                        // Primary AST-coupled test fails reliably when its module regresses.
                         if m == touched_mod && t == 0 {
                             fail_prob = 0.90;
                         } else if m == touched_mod && t == 1 {
                             fail_prob = 0.45;
                         }
-                        // Cross-module co-failure without AST edge.
                         if touched_mod == 4 && m == 0 && t == 2 {
                             fail_prob = 0.85;
                         }
@@ -121,7 +114,6 @@ pub mod tests {
                     } else {
                         TestStatus::Pass
                     };
-                    // Tests take 150-250ms each -> full suite ~4000ms, 20% budget ~800ms (~4 tests).
                     let duration_ms = 150 + ((m * 17 + t * 23) as u64 % 100);
 
                     outcomes.push(HistoricalOutcome {
@@ -242,7 +234,6 @@ pub mod tests {
                 let module_idx = t % 5;
                 let file_path = format!("tests/test_pkg_{module_idx}.py");
                 let status = if t == 9 {
-                    // Include one skipped test per run to confirm bins exclude skips.
                     TestStatus::Skip
                 } else if (module_idx == touched && t < 5 && rng.next_f64() < 0.75)
                     || rng.next_f64() < 0.03
@@ -278,7 +269,6 @@ pub mod tests {
             selector_config: Config::default(),
         };
 
-        // Pass runs in reverse order to verify strict internal chronological ordering.
         let mut reversed_runs = runs.clone();
         reversed_runs.reverse();
         let report_full =
@@ -286,7 +276,6 @@ pub mod tests {
         assert!(report_full.zero_leakage_verified);
         assert_eq!(report_full.evaluated_runs, 30);
 
-        // 30 evaluated runs x 9 non-skip tests per run = 270 evaluated test outcomes.
         let expected_outcomes = 30 * (tests_per_run - 1);
         assert_eq!(
             report_full.calibration_bins.raw_gbdt.len(),

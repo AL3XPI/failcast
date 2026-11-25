@@ -93,7 +93,6 @@ impl PlattCalibrator {
         let zs: Vec<f64> = pairs.iter().map(|&(z, _)| z).collect();
         let ys: Vec<bool> = pairs.iter().map(|&(_, y)| y).collect();
 
-        // Initialize at slope 1.0 and smoothed calibration prior intercept.
         let mut a = 1.0_f64;
         let mut b = ((n_pos as f64 + 1.0) / (n_neg as f64 + 1.0)).ln();
         let mut loss = objective(&zs, &targets, a, b);

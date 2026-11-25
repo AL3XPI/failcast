@@ -14,7 +14,7 @@ pub fn ast_hop_decay(ast_min_hop: f64) -> f64 {
     }
 }
 
-/// Cold-start deterministic heuristic ranker (SPEC.md Section 5.2).
+/// Cold-start deterministic heuristic ranker.
 /// Returns a bounded failure probability estimate in `(0.0, 1.0)`.
 pub fn score_heuristic(features: &[f64; NUM_FEATURES]) -> f64 {
     let direct_test_modified = nan_to_zero(features[IDX_DIRECT_TEST_MODIFIED]);

@@ -92,16 +92,13 @@ class TestCollectGhaPytest(unittest.TestCase):
         parsed = collector.parse_pytest_log(VERBOSE_PYTEST_LOG_FIXTURE)
         self.assertEqual(parsed.source, "pytest_log")
         self.assertEqual(len(parsed.outcomes), 5)
-        # Two tests had explicit --durations entries (test_escape + test_parse_basic).
         self.assertEqual(parsed.exact_duration_count, 2)
-        # 2.00s across 4 non-skip tests => 500ms fallback estimate.
         self.assertEqual(parsed.fallback_duration_ms, 500)
 
         by_id = {o["test_id"]: o for o in parsed.outcomes}
 
         escape = by_id["tests/test_urls.py::TestQuery::test_escape[utf8]"]
         self.assertEqual(escape["status"], "fail")
-        # 0.35s call + 0.05s setup = 400 ms exact.
         self.assertEqual(escape["duration_ms"], 400)
         self.assertEqual(escape["file_path"], "tests/test_urls.py")
         self.assertEqual(escape["failure_excerpt"], "AssertionError: bad percent encoding")

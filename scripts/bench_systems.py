@@ -145,7 +145,6 @@ def create_offline_fixture_repo(pts_bin: Path, num_tests: int = 1000) -> Path:
 
     run_cmd([str(pts_bin), "init", "--history-limit", "50"], cwd=repo_dir)
 
-    # Generate 40 synthetic historical runs in JSONL and import + train so GBDT mode is active.
     jsonl_path = repo_dir / ".pts" / "fixture_runs.jsonl"
     base_ts = 1_720_000_000
     with jsonl_path.open("w", encoding="utf-8") as fh:
@@ -282,7 +281,6 @@ def main() -> int:
     raw_mb, stripped_mb = measure_stripped_binary_mb(pts_bin)
     print(f"[bench] Binary size: stripped={stripped_mb:.2f} MB (raw={raw_mb:.2f} MB)", file=sys.stderr)
 
-    # Pure pts-ml scoring benchmark.
     infer_proc = run_cmd([str(infer_bin)], cwd=workspace_root)
     infer_data = json.loads(infer_proc.stdout.strip())
     print(
@@ -298,7 +296,6 @@ def main() -> int:
     if args.repo_dir is not None and (args.repo_dir / ".pts" / "store.db").is_file():
         repo_dir = args.repo_dir.resolve()
         target_label = detect_repo_label(repo_dir)
-        # Ensure trained GBDT model exists if possible.
         if not (repo_dir / ".pts" / "model.json").is_file():
             run_cmd([str(pts_bin), "train"], cwd=repo_dir, check=False)
         # Ensure working tree has a small diff during measurement, then restore cleanly.
@@ -316,7 +313,6 @@ def main() -> int:
         target_label = "synthetic-1000-tests-fixture"
 
     try:
-        # Prime the SQLite test discovery cache once before measuring warm CLI latency.
         print("[bench] Priming SQLite discovery cache...", file=sys.stderr)
         prime = run_cmd(
             [str(pts_bin), "run", "--budget", "15", "--dry-run", "--json", "--refresh-tests"],

@@ -1,8 +1,7 @@
 //! Local MCP server over stdio using `rmcp`.
 //!
-//! Invariant 5 (Stdio MCP Purity): `stdout` is owned exclusively by JSON-RPC framing.
-//! All tracing logs, warnings, and runner/git subprocess outputs MUST go to `stderr` or
-//! be captured via pipes.
+//! `stdout` is owned exclusively by JSON-RPC framing; tracing logs, warnings, and
+//! subprocess outputs must go to `stderr` or be captured via pipes.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -44,7 +43,7 @@ impl From<SelectionReason> for McpSelectionReason {
     }
 }
 
-/// Input parameters for the `select_tests` MCP tool (SPEC.md Section 6.2).
+/// Input parameters for the `select_tests` MCP tool.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct SelectTestsParams {
     /// Time budget in seconds (defaults to repo config `default_budget_secs`, 15s).
@@ -70,7 +69,7 @@ pub struct McpSelectedTest {
     pub reason: McpSelectionReason,
 }
 
-/// Structured output for the `select_tests` MCP tool (SPEC.md Section 6.2).
+/// Structured output for the `select_tests` MCP tool.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SelectTestsOutput {
     pub model_mode: String,
@@ -81,7 +80,7 @@ pub struct SelectTestsOutput {
     pub selected: Vec<McpSelectedTest>,
 }
 
-/// Input parameters for the `run_fast_tests` MCP tool (SPEC.md Section 6.2).
+/// Input parameters for the `run_fast_tests` MCP tool.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct RunFastTestsParams {
     /// Time budget in seconds (defaults to repo config `default_budget_secs`, 15s).
@@ -98,7 +97,7 @@ pub struct RunFastTestsParams {
     pub refresh_tests: Option<bool>,
 }
 
-/// Structured output for the `run_fast_tests` MCP tool (SPEC.md Section 6.2).
+/// Structured output for the `run_fast_tests` MCP tool.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RunFastTestsOutput {
     pub run_id: String,
@@ -111,7 +110,7 @@ pub struct RunFastTestsOutput {
     pub failures: Vec<FailureSummary>,
 }
 
-/// Input parameters for the `explain_selection` MCP tool (SPEC.md Section 6.2).
+/// Input parameters for the `explain_selection` MCP tool.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ExplainSelectionParams {
     /// Canonical test identifier (e.g. `"tests/test_auth.py::test_refresh_token"`).

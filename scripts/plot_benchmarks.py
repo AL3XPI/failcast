@@ -27,7 +27,7 @@ import matplotlib.ticker as mtick
 
 STRATEGY_STYLES: dict[str, dict[str, Any]] = {
     "PTS (GBDT+Platt)": {
-        "color": "#0F766E",  # Deep teal (high contrast, colorblind-safe)
+        "color": "#0F766E",
         "marker": "o",
         "linewidth": 2.8,
         "markersize": 7.5,
@@ -35,7 +35,7 @@ STRATEGY_STYLES: dict[str, dict[str, Any]] = {
         "zorder": 6,
     },
     "Heuristic": {
-        "color": "#2563EB",  # Crisp royal blue
+        "color": "#2563EB",
         "marker": "s",
         "linewidth": 2.0,
         "markersize": 6.0,
@@ -43,7 +43,7 @@ STRATEGY_STYLES: dict[str, dict[str, Any]] = {
         "zorder": 5,
     },
     "StaticAst": {
-        "color": "#D97706",  # Warm amber
+        "color": "#D97706",
         "marker": "^",
         "linewidth": 1.9,
         "markersize": 6.2,
@@ -51,7 +51,7 @@ STRATEGY_STYLES: dict[str, dict[str, Any]] = {
         "zorder": 4,
     },
     "RecentFailureRate": {
-        "color": "#7C3AED",  # Muted violet
+        "color": "#7C3AED",
         "marker": "D",
         "linewidth": 1.9,
         "markersize": 5.8,
@@ -59,7 +59,7 @@ STRATEGY_STYLES: dict[str, dict[str, Any]] = {
         "zorder": 3,
     },
     "Random": {
-        "color": "#64748B",  # Neutral slate
+        "color": "#64748B",
         "marker": "x",
         "linewidth": 1.6,
         "markersize": 6.2,
@@ -113,19 +113,16 @@ def spread_label_y_positions(
     ordered = sorted(points, key=lambda item: item[1])
     ys = [max(y_min, min(y_max, y)) for _, y in ordered]
 
-    # Forward pass to push overlapping labels apart upwards.
     for i in range(1, len(ys)):
         if ys[i] - ys[i - 1] < min_gap:
             ys[i] = ys[i - 1] + min_gap
 
-    # If top overflowed, shift back down preserving minimum gap.
     if ys and ys[-1] > y_max:
         overflow = ys[-1] - y_max
         ys[-1] = y_max
         for i in range(len(ys) - 2, -1, -1):
             ys[i] = min(ys[i], ys[i + 1] - min_gap)
         if ys[0] < y_min:
-            # Distribute evenly within bounds if very crowded.
             step = (y_max - y_min) / max(1, len(ys) - 1)
             ys = [y_min + i * step for i in range(len(ys))]
             _ = overflow
@@ -182,7 +179,6 @@ def plot_pareto_fdr_vs_budget(
         )
         end_points.append((name, ys[-1]))
 
-    # Annotate PTS data points directly for quick visual inspection.
     if "PTS (GBDT+Platt)" in series:
         pts_ys = series["PTS (GBDT+Platt)"]
         for x_val, y_val in zip(x_budgets[: len(pts_ys)], pts_ys):
@@ -198,7 +194,6 @@ def plot_pareto_fdr_vs_budget(
                 color=STRATEGY_STYLES["PTS (GBDT+Platt)"]["color"],
             )
 
-    # Direct right-margin labels with collision avoidance.
     x_max = max(x_budgets)
     x_min = min(x_budgets)
     span = max(10.0, x_max - x_min)
@@ -284,7 +279,6 @@ def choose_reliability_label_offsets(
     dx_scale = 1.08 / 320.0
     dy_scale = 1.22 / 245.0
 
-    # Candidate offsets ordered from closest/cleanest to staggered callouts.
     candidates = [
         (0.0, 12.0),
         (0.0, -16.0),
@@ -321,7 +315,6 @@ def choose_reliability_label_offsets(
 
             score = 0.002 * ((dx_pt**2 + dy_pt**2) ** 0.5)
 
-            # Keep inside visible axes bounds.
             if cx - half_w < -0.04 or cx + half_w > 1.04:
                 score += 50.0
             if cy - half_h < -0.10 or cy + half_h > 1.10:
@@ -331,14 +324,12 @@ def choose_reliability_label_offsets(
             if cx + half_w > 0.58 and cy + half_h > 0.34 and cy - half_h < 0.58:
                 score += 40.0
 
-            # Strong penalty for overlapping any already placed label box.
             for px, py, pw, ph in placed_boxes:
                 ox = (half_w + pw + 0.018) - abs(cx - px)
                 oy = (half_h + ph + 0.018) - abs(cy - py)
                 if ox > 0.0 and oy > 0.0:
                     score += 100.0 + 200.0 * ox * oy
 
-            # Penalize landing on top of any data marker (other than slight distance from self).
             for j, (ox_pt, oy_pt) in enumerate(zip(xs, ys)):
                 if j == idx:
                     continue
@@ -346,13 +337,11 @@ def choose_reliability_label_offsets(
                 if d_pt < 0.06:
                     score += 35.0 * (0.06 - d_pt) / 0.06
 
-            # Penalize intersecting or sitting directly on any reliability curve segment.
             for sx1, sy1, sx2, sy2 in segments:
                 dist = _point_to_segment_dist(cx, cy, sx1, sy1, sx2, sy2)
                 if dist < 0.055:
                     score += 25.0 * (0.055 - dist) / 0.055
 
-            # Mild penalty for sitting right on the y = x perfect-calibration diagonal.
             diag_dist = abs(cy - cx) / (2.0**0.5)
             if diag_dist < 0.04:
                 score += 8.0 * (0.04 - diag_dist) / 0.04
@@ -430,7 +419,6 @@ def plot_calibration_reliability(
         ys = [float(b["empirical_positive_rate"]) for b in non_empty]
         counts = [int(b["count"]) for b in non_empty]
 
-        # Perfect calibration diagonal.
         ax_top.plot(
             [0.0, 1.0],
             [0.0, 1.0],
@@ -455,7 +443,6 @@ def plot_calibration_reliability(
                 label=panel_title,
             )
 
-            # Annotate populated bins with non-overlapping offsets avoiding curve lines and badges.
             label_texts = [
                 f"n={cnt:,}" if cnt < 10000 else f"n={cnt / 1000:.1f}k" for cnt in counts
             ]
@@ -495,7 +482,6 @@ def plot_calibration_reliability(
         if col == 0:
             ax_top.set_ylabel("Empirical Failure Rate", fontweight="bold", labelpad=8)
 
-        # Brier score + total outcome callout badge placed in the clear upper-right area.
         badge_text = f"Brier Score: {brier_val:.4f}\nOutcomes: {total_samples:,}"
         ax_top.text(
             0.96,
@@ -515,7 +501,6 @@ def plot_calibration_reliability(
             },
         )
 
-        # Bottom panel: sample distribution histogram per 0.1 bin (log scale when skewed).
         centers = [float(b["bin_center"]) for b in bins]
         all_counts = [int(b["count"]) for b in bins]
         ax_bot.bar(

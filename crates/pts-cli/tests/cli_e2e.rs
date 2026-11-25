@@ -54,14 +54,12 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         copy_dir_recursive(&fixture_repo_path(), tmp.path());
 
-        // 1. Run `pts init`.
         cargo_bin_cmd!("pts")
             .current_dir(tmp.path())
             .arg("init")
             .assert()
             .success();
 
-        // 2. Run `pts run --all` with PTS_FIXTURE_FAIL=1; must exit with code 1.
         cargo_bin_cmd!("pts")
             .current_dir(tmp.path())
             .env("PTS_FIXTURE_FAIL", "1")
@@ -69,7 +67,6 @@ mod tests {
             .assert()
             .code(1);
 
-        // 3. Open .pts/store.db directly and verify persisted run and outcomes.
         let db_path = tmp.path().join(".pts").join("store.db");
         assert!(db_path.is_file(), "store.db must exist");
 
@@ -133,18 +130,15 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         copy_dir_recursive(&fixture_repo_path(), tmp.path());
 
-        // Initialize a git repository with an initial commit.
         git_cmd(tmp.path(), &["init"]);
         git_cmd(tmp.path(), &["add", "."]);
         git_cmd(tmp.path(), &["commit", "-m", "initial fixture commit"]);
 
-        // Make a working-tree edit to src/calc.py (keeps existing functions passing).
         let calc_path = tmp.path().join("src/calc.py");
         let mut calc_src = fs::read_to_string(&calc_path).expect("read src/calc.py");
         calc_src.push_str("\n\ndef multiply(a: int, b: int) -> int:\n    return a * b\n");
         fs::write(&calc_path, calc_src).expect("modify src/calc.py");
 
-        // 1. Run `pts init` and verify git history was mined into SQLite.
         cargo_bin_cmd!("pts")
             .current_dir(tmp.path())
             .arg("init")
@@ -160,7 +154,6 @@ mod tests {
             .expect("count commits");
         assert_eq!(commit_count, 1, "pts init must mine initial git commit");
 
-        // 2. Run `pts run --budget 5 --dry-run --json`: exits 0, writes 0 runs to DB.
         let dry_output = cargo_bin_cmd!("pts")
             .current_dir(tmp.path())
             .args(["run", "--budget", "5", "--dry-run", "--json"])
@@ -184,7 +177,6 @@ mod tests {
             .expect("count runs after dry run");
         assert_eq!(runs_after_dry, 0, "dry-run must write 0 runs to DB");
 
-        // 3. Run `pts run --budget 5`: executes selected tests and persists metadata.
         cargo_bin_cmd!("pts")
             .current_dir(tmp.path())
             .args(["run", "--budget", "5"])
@@ -279,15 +271,13 @@ mod tests {
         git_cmd(tmp.path(), &["add", "."]);
         git_cmd(tmp.path(), &["commit", "-m", "initial fixture commit"]);
 
-        // 1. Initialize store.
         cargo_bin_cmd!("pts")
             .current_dir(tmp.path())
             .arg("init")
             .assert()
             .success();
 
-        // 2. Populate DB with 105 chronological synthetic runs (>= default min_runs_for_ml=100
-        //    and >= min_failures_for_ml=25) so `pts run` automatically activates GBDT mode.
+        // Populate 105 runs to cross default min_runs_for_ml=100 and min_failures_for_ml=25.
         let db_path = tmp.path().join(".pts").join("store.db");
         let mut store = Store::open(&db_path).expect("open store");
         store.migrate().expect("migrate");
@@ -402,7 +392,6 @@ mod tests {
         }
         drop(store);
 
-        // 3. Execute `pts train` and verify `.pts/model.json` and `models` SQLite row.
         let train_out = cargo_bin_cmd!("pts")
             .current_dir(tmp.path())
             .arg("train")
@@ -438,7 +427,6 @@ mod tests {
             "models table must contain 1 trained model row"
         );
 
-        // 4. Modify src/calc.py and run `pts run --budget 5 --dry-run --json` -> assert model_mode == "gbdt".
         let calc_path = tmp.path().join("src/calc.py");
         let mut calc_src = fs::read_to_string(&calc_path).expect("read src/calc.py");
         calc_src.push_str("\n\ndef sub(a: int, b: int) -> int:\n    return a - b\n");
@@ -457,7 +445,6 @@ mod tests {
         assert_eq!(dry_json["model_mode"], "gbdt");
         assert!(dry_json["selected_count"].as_u64().unwrap_or(0) >= 1);
 
-        // 5. Run `pts eval --output-json report.json` and verify valid JSON and Markdown output.
         let eval_out = cargo_bin_cmd!("pts")
             .current_dir(tmp.path())
             .args([
@@ -503,14 +490,12 @@ mod tests {
         git_cmd(tmp.path(), &["add", "."]);
         git_cmd(tmp.path(), &["commit", "-m", "commit 1: clean"]);
 
-        // Commit 2: introduce a syntax error in tests/test_calc.py (should be gracefully skipped).
         let test_path = tmp.path().join("tests/test_calc.py");
         let orig_test_src = fs::read_to_string(&test_path).expect("read test_calc.py");
         fs::write(&test_path, "def broken(:\n    pass\n").expect("write broken test");
         git_cmd(tmp.path(), &["add", "."]);
         git_cmd(tmp.path(), &["commit", "-m", "commit 2: broken syntax"]);
 
-        // Commit 3: restore valid tests and add a helper function.
         fs::write(&test_path, &orig_test_src).expect("restore test_calc.py");
         let calc_path = tmp.path().join("src/calc.py");
         let mut calc_src = fs::read_to_string(&calc_path).expect("read calc.py");
@@ -519,7 +504,6 @@ mod tests {
         git_cmd(tmp.path(), &["add", "."]);
         git_cmd(tmp.path(), &["commit", "-m", "commit 3: fixed + square"]);
 
-        // Leave an uncommitted local edit in user's working tree to ensure backfill NEVER touches it.
         let marker_edit = format!("{calc_src}\n# uncommitted user edit\n");
         fs::write(&calc_path, &marker_edit).expect("write uncommitted edit");
 
@@ -535,13 +519,11 @@ mod tests {
             .assert()
             .success();
 
-        // User's working tree must remain completely untouched.
         assert_eq!(
             fs::read_to_string(&calc_path).expect("read calc.py after backfill"),
             marker_edit
         );
 
-        // Exactly 2 valid commits persisted with mode = 'backfill', 1 broken commit skipped.
         let db_path = tmp.path().join(".pts").join("store.db");
         let conn = Connection::open(&db_path).expect("open store.db");
         let backfill_runs: i64 = conn
@@ -556,7 +538,6 @@ mod tests {
             "expected 2 valid commits backfilled and 1 broken skipped"
         );
 
-        // No lingering git worktrees besides the main repo.
         let wt_out = Command::new("git")
             .args(["worktree", "list", "--porcelain"])
             .current_dir(tmp.path())
@@ -581,7 +562,6 @@ mod tests {
         git_cmd(tmp.path(), &["add", "."]);
         git_cmd(tmp.path(), &["commit", "-m", "initial fixture commit"]);
 
-        // Make a working-tree edit to src/calc.py (imported at 1 AST hop by tests/test_calc.py).
         let calc_path = tmp.path().join("src/calc.py");
         let mut calc_src = fs::read_to_string(&calc_path).expect("read src/calc.py");
         calc_src.push_str("\n\ndef power(a: int, b: int) -> int:\n    return a ** b\n");
@@ -593,7 +573,6 @@ mod tests {
             .assert()
             .success();
 
-        // 1. JSON mode: verify schema, scores, and AST hop feature.
         let json_out = cargo_bin_cmd!("pts")
             .current_dir(tmp.path())
             .args(["explain", "tests/test_calc.py::test_add_positive", "--json"])
@@ -645,7 +624,6 @@ mod tests {
             "top_signals must highlight ast_min_hop"
         );
 
-        // 2. Human-readable table output succeeds and includes key sections.
         let text_out = cargo_bin_cmd!("pts")
             .current_dir(tmp.path())
             .args(["explain", "tests/test_calc.py::test_add_positive"])
@@ -659,7 +637,6 @@ mod tests {
         assert!(text.contains("16-Feature Breakdown:"));
         assert!(text.contains("ast_min_hop"));
 
-        // 3. Unknown test ID must exit non-zero with a clear error message.
         let err_out = cargo_bin_cmd!("pts")
             .current_dir(tmp.path())
             .args(["explain", "tests/test_calc.py::test_does_not_exist"])
@@ -687,7 +664,6 @@ mod tests {
         git_cmd(tmp.path(), &["add", "."]);
         git_cmd(tmp.path(), &["commit", "-m", "initial fixture commit"]);
 
-        // Edit src/calc.py so diff_files_count == 1 and ast_min_hop == 1.0.
         let calc_path = tmp.path().join("src/calc.py");
         let mut calc_src = fs::read_to_string(&calc_path).expect("read src/calc.py");
         calc_src.push_str("\n\ndef negate(a: int) -> int:\n    return -a\n");
@@ -699,7 +675,6 @@ mod tests {
             .assert()
             .success();
 
-        // Spawn the real compiled `pts mcp` binary over piped stdin/stdout/stderr.
         let mut child = Command::new(env!("CARGO_BIN_EXE_pts"))
             .arg("mcp")
             .current_dir(tmp.path())
@@ -746,7 +721,6 @@ mod tests {
             }
         };
 
-        // 1. initialize
         send_msg(
             &mut stdin,
             &serde_json::json!({
@@ -771,7 +745,6 @@ mod tests {
             "server must advertise tools capability: {init_resp}"
         );
 
-        // 2. notifications/initialized
         send_msg(
             &mut stdin,
             &serde_json::json!({
@@ -780,7 +753,6 @@ mod tests {
             }),
         );
 
-        // 3. tools/list
         send_msg(
             &mut stdin,
             &serde_json::json!({
@@ -831,7 +803,6 @@ mod tests {
             serde_json::from_str(text).expect("parse tool text content as JSON")
         };
 
-        // 4. tools/call -> select_tests
         send_msg(
             &mut stdin,
             &serde_json::json!({
@@ -856,7 +827,6 @@ mod tests {
         assert_eq!(select_json["total_discovered_tests"], 4);
         assert!(select_json["selected_count"].as_u64().unwrap_or(0) >= 1);
 
-        // 5. tools/call -> explain_selection
         send_msg(
             &mut stdin,
             &serde_json::json!({
@@ -881,7 +851,6 @@ mod tests {
         assert_eq!(explain_json["features"]["ast_min_hop"].as_f64(), Some(1.0));
         assert!(explain_json["yield_score"].as_f64().unwrap_or(0.0) > 0.0);
 
-        // 6. tools/call -> run_fast_tests (with PTS_FIXTURE_FAIL=1)
         send_msg(
             &mut stdin,
             &serde_json::json!({
@@ -924,7 +893,6 @@ mod tests {
             "failure_message must be truncated to <= 1500 chars"
         );
 
-        // Close stdin to cleanly shut down the MCP server, then drain remaining stdout.
         drop(stdin);
         let mut trailing = String::new();
         while reader.read_line(&mut trailing).expect("drain stdout") > 0 {
@@ -950,7 +918,6 @@ mod tests {
             "expected exactly 5 JSON-RPC responses on stdout"
         );
 
-        // Verify the run executed via MCP was persisted cleanly to .pts/store.db.
         let db_path = tmp.path().join(".pts").join("store.db");
         let conn = Connection::open(&db_path).expect("open store.db");
         let persisted_exit: i32 = conn
@@ -987,7 +954,6 @@ mod tests {
             .assert()
             .success();
 
-        // Write a deterministic JSONL history file of 40 chronological CI/PR runs.
         let mut jsonl = String::new();
         for r in 0..40usize {
             let started_at = 1_710_000_000 + (r as i64) * 900;
@@ -1042,14 +1008,12 @@ mod tests {
         let jsonl_path = tmp.path().join("ci_history.jsonl");
         fs::write(&jsonl_path, &jsonl).expect("write ci_history.jsonl");
 
-        // 1. Run `pts import-runs ci_history.jsonl`.
         cargo_bin_cmd!("pts")
             .current_dir(tmp.path())
             .args(["import-runs", "ci_history.jsonl"])
             .assert()
             .success();
 
-        // 2. Verify rows persisted in .pts/store.db with mode = 'backfill'.
         let db_path = tmp.path().join(".pts").join("store.db");
         let conn = Connection::open(&db_path).expect("open store.db");
 
@@ -1072,7 +1036,6 @@ mod tests {
             .expect("count imported diff files");
         assert_eq!(total_diff_rows, 40);
 
-        // 3. Run `pts train` on the imported history.
         cargo_bin_cmd!("pts")
             .current_dir(tmp.path())
             .arg("train")
@@ -1083,7 +1046,6 @@ mod tests {
             "model.json must be generated from imported runs"
         );
 
-        // 4. Run `pts eval --output-json report.json` and assert valid benchmark output.
         let eval_out = cargo_bin_cmd!("pts")
             .current_dir(tmp.path())
             .args([
@@ -1166,7 +1128,6 @@ mod tests {
             .assert()
             .success();
 
-        // 1. First dry-run misses cache -> invokes pytest --collect-only once and populates cache.
         let out1 = cargo_bin_cmd!("pts")
             .current_dir(tmp.path())
             .args(["run", "--budget", "5", "--dry-run", "--json"])
@@ -1183,7 +1144,6 @@ mod tests {
             "first dry-run must invoke pytest once"
         );
 
-        // 2. Second dry-run AND `pts explain` hit SQLite cache -> zero new pytest invocations!
         let out2 = cargo_bin_cmd!("pts")
             .current_dir(tmp.path())
             .args(["run", "--budget", "5", "--dry-run", "--json"])
@@ -1211,7 +1171,6 @@ mod tests {
             "pts explain must also hit SQLite discovery cache"
         );
 
-        // 3. Adding a new test to tests/test_calc.py changes the discovery fingerprint -> cache miss.
         let test_file = tmp.path().join("tests/test_calc.py");
         let mut test_src = fs::read_to_string(&test_file).expect("read test_calc.py");
         test_src.push_str("\n\ndef test_cache_invalidation_check():\n    assert 2 + 2 == 4\n");
@@ -1236,7 +1195,6 @@ mod tests {
             "test file modification must invalidate cache and re-run pytest"
         );
 
-        // 4. `--refresh-tests` forces fresh discovery even when fingerprint is unchanged.
         cargo_bin_cmd!("pts")
             .current_dir(tmp.path())
             .args([
