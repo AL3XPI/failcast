@@ -1,11 +1,12 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use failcast_collectors::{
-    ImportGraph, ImportGraphBuilder, PythonImportGraphBuilder, extract_working_diff, is_git_repo,
+    CachedAstFile, CachedImportGraphResult, ImportGraph, ImportGraphBuilder,
+    PythonImportGraphBuilder, extract_working_diff, is_git_repo,
 };
 use failcast_core::{
     Config, DiffFile, DiffSummary, FailcastError, HistoricalRun, HistorySnapshot, RunMode,
@@ -24,7 +25,7 @@ use failcast_ml::{
     should_use_heuristic,
 };
 use failcast_runners::{PytestRunner, normalize_posix_path};
-use failcast_store::{RunRecord, Store, TestOutcomeRecord};
+use failcast_store::{AstFileCacheEntry, RunRecord, Store, TestOutcomeRecord};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -230,8 +231,9 @@ pub fn select_for_working_tree(
     let config = Config::load(repo_root)?;
     let db_path = repo_root.join(".failcast").join("store.db");
     let diff = load_working_diff(repo_root)?;
+    let mut store = open_migrated_store(&db_path)?;
 
-    let discovered = discover_tests_cached(repo_root, &config, &db_path, refresh_tests)?;
+    let discovered = discover_tests_cached(repo_root, &config, store.as_mut(), refresh_tests)?;
     let now_ts = current_unix_ts();
 
     let (mode, mode_label, model_mode, budget_ms, selected_plan): (
@@ -244,11 +246,11 @@ pub fn select_for_working_tree(
         (RunMode::All, "all", "full", None, None)
     } else {
         let modified_paths: Vec<&str> = diff.files.iter().map(|f| f.path.as_str()).collect();
-        let history = load_history_or_default(&db_path, now_ts, &modified_paths)?;
+        let history = load_history_or_default(store.as_ref(), now_ts, &modified_paths)?;
         let loaded_model = try_load_model(repo_root);
         let use_gbdt = !should_use_heuristic(&history, &config, loaded_model.is_some());
 
-        let graph = PythonImportGraphBuilder::new().build(repo_root)?;
+        let graph = build_import_graph_cached(repo_root, store.as_mut())?;
 
         let feature_rows: Vec<[f64; NUM_FEATURES]> = discovered
             .iter()
@@ -517,7 +519,8 @@ pub fn run_selected_tests(
 pub fn explain_test(repo_root: &Path, test_id: &str, refresh_tests: bool) -> Result<ExplainReport> {
     let config = Config::load(repo_root)?;
     let db_path = repo_root.join(".failcast").join("store.db");
-    let discovered = discover_tests_cached(repo_root, &config, &db_path, refresh_tests)?;
+    let mut store = open_migrated_store(&db_path)?;
+    let discovered = discover_tests_cached(repo_root, &config, store.as_mut(), refresh_tests)?;
 
     let normalized_query = normalize_test_id(test_id);
     let Some(test_case) = discovered
@@ -533,11 +536,11 @@ pub fn explain_test(repo_root: &Path, test_id: &str, refresh_tests: bool) -> Res
     let diff = load_working_diff(repo_root)?;
     let now_ts = current_unix_ts();
     let modified_paths: Vec<&str> = diff.files.iter().map(|f| f.path.as_str()).collect();
-    let history = load_history_or_default(&db_path, now_ts, &modified_paths)?;
+    let history = load_history_or_default(store.as_ref(), now_ts, &modified_paths)?;
     let loaded_model = try_load_model(repo_root);
     let use_gbdt = !should_use_heuristic(&history, &config, loaded_model.is_some());
 
-    let graph = PythonImportGraphBuilder::new().build(repo_root)?;
+    let graph = build_import_graph_cached(repo_root, store.as_mut())?;
     let ast_min_hop = graph.min_hop_to_any(&test_case.file_path, &modified_paths);
     let features = extract_features(test_case, &diff, &history, ast_min_hop);
 
@@ -785,21 +788,72 @@ fn is_discovery_relevant_file(rel_posix: &str, file_name: &str) -> bool {
         || rel_posix.contains("/tests/")
 }
 
+/// Incrementally builds the Python import graph using `ast_file_cache` in `store`,
+/// parsing only new or modified `.py` files and pruning deleted ones.
+pub fn build_import_graph_with_store(
+    repo_root: &Path,
+    store: &mut Store,
+) -> Result<CachedImportGraphResult> {
+    let cached_entries = store.load_ast_file_cache()?;
+    let cached_map: BTreeMap<String, CachedAstFile> = cached_entries
+        .into_iter()
+        .map(|(path, entry)| {
+            (
+                path.clone(),
+                CachedAstFile {
+                    file_path: path,
+                    file_size: entry.file_size,
+                    mtime_ns: entry.mtime_ns,
+                    imports_json: entry.imports_json,
+                },
+            )
+        })
+        .collect();
+
+    let result = PythonImportGraphBuilder::new().build_with_cache(repo_root, &cached_map)?;
+    let upsert_entries: Vec<AstFileCacheEntry> = result
+        .upserts
+        .iter()
+        .map(|u| AstFileCacheEntry {
+            file_path: u.file_path.clone(),
+            file_size: u.file_size,
+            mtime_ns: u.mtime_ns,
+            imports_json: u.imports_json.clone(),
+        })
+        .collect();
+    store.sync_ast_file_cache(&upsert_entries, &result.deleted_paths)?;
+    Ok(result)
+}
+
+fn build_import_graph_cached(repo_root: &Path, store: Option<&mut Store>) -> Result<ImportGraph> {
+    if let Some(store) = store {
+        Ok(build_import_graph_with_store(repo_root, store)?.graph)
+    } else {
+        Ok(PythonImportGraphBuilder::new().build(repo_root)?)
+    }
+}
+
+fn open_migrated_store(db_path: &Path) -> Result<Option<Store>> {
+    if !db_path.is_file() {
+        return Ok(None);
+    }
+    let store = Store::open(db_path)?;
+    store.migrate()?;
+    Ok(Some(store))
+}
+
 fn discover_tests_cached(
     repo_root: &Path,
     config: &Config,
-    db_path: &Path,
+    store: Option<&mut Store>,
     refresh_tests: bool,
 ) -> Result<Vec<TestCase>> {
     let runner = PytestRunner::from_config(config);
-    if !db_path.is_file() {
+    let Some(store) = store else {
         return Ok(runner.discover(repo_root)?);
-    }
+    };
 
     let fingerprint = compute_discovery_fingerprint(repo_root)?;
-    let mut store = Store::open(db_path)?;
-    store.migrate()?;
-
     if !refresh_tests
         && store.get_meta(DISCOVERY_FINGERPRINT_META_KEY)?.as_deref() == Some(fingerprint.as_str())
     {
@@ -827,12 +881,11 @@ fn load_working_diff(repo_root: &Path) -> Result<DiffSummary> {
 }
 
 fn load_history_or_default(
-    db_path: &Path,
+    store: Option<&Store>,
     now_ts: i64,
     diff_paths: &[&str],
 ) -> Result<HistorySnapshot> {
-    if db_path.is_file() {
-        let store = Store::open(db_path)?;
+    if let Some(store) = store {
         Ok(store.load_history_snapshot_for_diff(now_ts, diff_paths)?)
     } else {
         Ok(HistorySnapshot::default())

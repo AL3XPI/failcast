@@ -17,8 +17,17 @@ CREATE TABLE IF NOT EXISTS repo_meta (
 );
 CREATE INDEX IF NOT EXISTS idx_run_diff_files_path ON run_diff_files(file_path);
 ";
+const SCHEMA_V3_SQL: &str = "
+CREATE TABLE IF NOT EXISTS ast_file_cache (
+    file_path TEXT PRIMARY KEY,
+    file_size INTEGER NOT NULL,
+    mtime_ns INTEGER NOT NULL,
+    imports_json TEXT NOT NULL
+);
+";
 const SCHEMA_VERSION_V1: i64 = 1;
 const SCHEMA_VERSION_V2: i64 = 2;
+const SCHEMA_VERSION_V3: i64 = 3;
 const SECONDS_PER_30_DAYS: i64 = 30 * 86_400;
 const MAX_COCHANGE_FILES_PER_COMMIT: usize = 200;
 const EWMA_ALPHA_10: f64 = 0.2;
@@ -70,6 +79,15 @@ pub struct ModelRecord {
     pub calibration_a: f64,
     pub calibration_b: f64,
     pub artifact_path: String,
+}
+
+/// Cached raw Python AST imports for a single repository file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AstFileCacheEntry {
+    pub file_path: String,
+    pub file_size: u64,
+    pub mtime_ns: i64,
+    pub imports_json: String,
 }
 
 /// Complete run payload for atomic multi-run persistence via `Store::persist_runs_batch`.
@@ -132,7 +150,113 @@ impl Store {
             )
             .map_err(store_err)?;
 
+        self.conn.execute_batch(SCHEMA_V3_SQL).map_err(store_err)?;
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![SCHEMA_VERSION_V3, applied_at],
+            )
+            .map_err(store_err)?;
+
         Ok(())
+    }
+
+    /// Loads all cached per-file AST import entries keyed by repo-relative POSIX path.
+    pub fn load_ast_file_cache(
+        &self,
+    ) -> Result<BTreeMap<String, AstFileCacheEntry>, FailcastError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "
+                SELECT file_path, file_size, mtime_ns, imports_json
+                FROM ast_file_cache
+                ORDER BY file_path ASC
+                ",
+            )
+            .map_err(store_err)?;
+
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(AstFileCacheEntry {
+                    file_path: r.get(0)?,
+                    file_size: r.get::<_, i64>(1)?.max(0) as u64,
+                    mtime_ns: r.get(2)?,
+                    imports_json: r.get(3)?,
+                })
+            })
+            .map_err(store_err)?;
+
+        let mut entries = BTreeMap::new();
+        for row in rows {
+            let entry = row.map_err(store_err)?;
+            entries.insert(entry.file_path.clone(), entry);
+        }
+        Ok(entries)
+    }
+
+    /// Atomically upserts changed/new entries and prunes deleted files from `ast_file_cache`.
+    /// Returns immediately without starting a write transaction when both slices are empty.
+    pub fn sync_ast_file_cache(
+        &mut self,
+        upserts: &[AstFileCacheEntry],
+        deleted_paths: &[String],
+    ) -> Result<(), FailcastError> {
+        if upserts.is_empty() && deleted_paths.is_empty() {
+            return Ok(());
+        }
+
+        let tx = self.conn.transaction().map_err(store_err)?;
+
+        if !upserts.is_empty() {
+            let mut stmt = tx
+                .prepare(
+                    "
+                    INSERT INTO ast_file_cache (file_path, file_size, mtime_ns, imports_json)
+                    VALUES (?1, ?2, ?3, ?4)
+                    ON CONFLICT(file_path) DO UPDATE SET
+                        file_size = excluded.file_size,
+                        mtime_ns = excluded.mtime_ns,
+                        imports_json = excluded.imports_json
+                    ",
+                )
+                .map_err(store_err)?;
+            for entry in upserts {
+                let file_size = entry.file_size.min(i64::MAX as u64) as i64;
+                stmt.execute(params![
+                    entry.file_path,
+                    file_size,
+                    entry.mtime_ns,
+                    entry.imports_json
+                ])
+                .map_err(store_err)?;
+            }
+        }
+
+        if !deleted_paths.is_empty() {
+            let mut del_stmt = tx
+                .prepare("DELETE FROM ast_file_cache WHERE file_path = ?1")
+                .map_err(store_err)?;
+            for path in deleted_paths {
+                del_stmt.execute(params![path]).map_err(store_err)?;
+            }
+        }
+
+        tx.commit().map_err(store_err)?;
+        Ok(())
+    }
+
+    /// Upserts changed/new AST file cache entries in a single transaction.
+    pub fn upsert_ast_file_cache(
+        &mut self,
+        entries: &[AstFileCacheEntry],
+    ) -> Result<(), FailcastError> {
+        self.sync_ast_file_cache(entries, &[])
+    }
+
+    /// Removes deleted file paths from `ast_file_cache` in a single transaction.
+    pub fn prune_ast_file_cache(&mut self, deleted_paths: &[String]) -> Result<(), FailcastError> {
+        self.sync_ast_file_cache(&[], deleted_paths)
     }
 
     pub fn get_meta(&self, key: &str) -> Result<Option<String>, FailcastError> {

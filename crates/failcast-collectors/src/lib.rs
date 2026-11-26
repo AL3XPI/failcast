@@ -3,7 +3,10 @@
 pub mod ast_python;
 pub mod git;
 
-pub use ast_python::{ImportGraph, ImportGraphBuilder, PythonImportGraphBuilder};
+pub use ast_python::{
+    CachedAstFile, CachedImportGraphResult, ImportGraph, ImportGraphBuilder,
+    PythonImportGraphBuilder,
+};
 pub use git::{
     TempGitWorktree, extract_working_diff, hash_author, is_git_repo, mine_commit_history,
     mine_commit_history_from_ref,
@@ -11,6 +14,7 @@ pub use git::{
 
 #[cfg(test)]
 pub mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::Path;
     use std::process::Command;
@@ -196,6 +200,129 @@ pub mod tests {
         assert_eq!(
             diff.diff_fingerprint,
             DiffSummary::compute_fingerprint(&diff.files)
+        );
+    }
+
+    #[test]
+    fn python_ast_incremental_cache_matches_cold_parse_and_handles_mutations() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+
+        fs::create_dir_all(root.join("src/pkg")).expect("mkdir src/pkg");
+        fs::create_dir_all(root.join("tests")).expect("mkdir tests");
+
+        fs::write(root.join("src/pkg/__init__.py"), "").expect("write __init__.py");
+        fs::write(
+            root.join("src/pkg/b.py"),
+            "def helper(x):\n    return x * 2\n",
+        )
+        .expect("write b.py");
+        fs::write(
+            root.join("src/pkg/a.py"),
+            "from . import b, extra\n\ndef compute(x):\n    return b.helper(x) + 1\n",
+        )
+        .expect("write a.py");
+        fs::write(
+            root.join("tests/test_a.py"),
+            "import pkg.a\n\ndef test_compute():\n    assert pkg.a.compute(2) == 5\n",
+        )
+        .expect("write test_a.py");
+
+        let builder = PythonImportGraphBuilder::new();
+        let mut cache: BTreeMap<String, CachedAstFile> = BTreeMap::new();
+
+        // 1. Cold build vs first incremental build must match identically.
+        let cold_1 = builder.build(root).expect("cold build 1");
+        let inc_1 = builder
+            .build_with_cache(root, &cache)
+            .expect("incremental build 1");
+        assert_eq!(inc_1.graph, cold_1);
+        assert_eq!(inc_1.parsed_files, 4);
+        assert_eq!(inc_1.cached_files, 0);
+        assert!(inc_1.deleted_paths.is_empty());
+
+        for entry in inc_1.upserts {
+            cache.insert(entry.file_path.clone(), entry);
+        }
+
+        // 2. Second run parses 0 files (100% cache hit).
+        let inc_2 = builder
+            .build_with_cache(root, &cache)
+            .expect("incremental build 2");
+        assert_eq!(inc_2.graph, cold_1);
+        assert_eq!(inc_2.parsed_files, 0);
+        assert_eq!(inc_2.cached_files, 4);
+        assert!(inc_2.upserts.is_empty());
+        assert!(inc_2.deleted_paths.is_empty());
+
+        // 3. Adding a sibling file referenced by unchanged a.py parses only the new file
+        //    and still resolves the new edge accurately.
+        fs::write(
+            root.join("src/pkg/extra.py"),
+            "def bonus():\n    return 10\n",
+        )
+        .expect("write extra.py");
+
+        let cold_2 = builder.build(root).expect("cold build 2");
+        let inc_3 = builder
+            .build_with_cache(root, &cache)
+            .expect("incremental build 3");
+        assert_eq!(inc_3.graph, cold_2);
+        assert_eq!(inc_3.parsed_files, 1);
+        assert_eq!(inc_3.cached_files, 4);
+        assert_eq!(inc_3.upserts.len(), 1);
+        assert_eq!(inc_3.upserts[0].file_path, "src/pkg/extra.py");
+        assert_eq!(
+            inc_3
+                .graph
+                .shortest_hop("tests/test_a.py", "src/pkg/extra.py"),
+            Some(2)
+        );
+        for entry in inc_3.upserts {
+            cache.insert(entry.file_path.clone(), entry);
+        }
+
+        // 4. Modifying an existing file invalidates only that file.
+        fs::write(
+            root.join("src/pkg/extra.py"),
+            "from . import leaf\n\ndef bonus():\n    return leaf.val()\n",
+        )
+        .expect("modify extra.py");
+        fs::write(root.join("src/pkg/leaf.py"), "def val():\n    return 1\n")
+            .expect("write leaf.py");
+
+        let cold_3 = builder.build(root).expect("cold build 3");
+        let inc_4 = builder
+            .build_with_cache(root, &cache)
+            .expect("incremental build 4");
+        assert_eq!(inc_4.graph, cold_3);
+        assert_eq!(inc_4.parsed_files, 2);
+        assert_eq!(inc_4.cached_files, 4);
+        assert_eq!(
+            inc_4
+                .graph
+                .shortest_hop("tests/test_a.py", "src/pkg/leaf.py"),
+            Some(3)
+        );
+        for entry in inc_4.upserts {
+            cache.insert(entry.file_path.clone(), entry);
+        }
+
+        // 5. Deleting a file parses 0 files, reports deleted_paths, and updates graph hops.
+        fs::remove_file(root.join("src/pkg/extra.py")).expect("remove extra.py");
+        let cold_4 = builder.build(root).expect("cold build 4");
+        let inc_5 = builder
+            .build_with_cache(root, &cache)
+            .expect("incremental build 5");
+        assert_eq!(inc_5.graph, cold_4);
+        assert_eq!(inc_5.parsed_files, 0);
+        assert_eq!(inc_5.cached_files, 5);
+        assert_eq!(inc_5.deleted_paths, vec!["src/pkg/extra.py".to_string()]);
+        assert_eq!(
+            inc_5
+                .graph
+                .shortest_hop("tests/test_a.py", "src/pkg/leaf.py"),
+            None
         );
     }
 }

@@ -1284,4 +1284,142 @@ mod tests {
             "--refresh-tests must force pytest discovery"
         );
     }
+
+    #[test]
+    fn cli_ast_cache_persists_reuses_and_prunes_in_sqlite() {
+        use failcast::service::build_import_graph_with_store;
+        use failcast_collectors::{ImportGraphBuilder, PythonImportGraphBuilder};
+        use failcast_store::Store;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        copy_dir_recursive(&fixture_repo_path(), tmp.path());
+
+        git_cmd(tmp.path(), &["init"]);
+        git_cmd(tmp.path(), &["add", "."]);
+        git_cmd(tmp.path(), &["commit", "-m", "initial commit"]);
+
+        cargo_bin_cmd!("failcast")
+            .current_dir(tmp.path())
+            .arg("init")
+            .assert()
+            .success();
+
+        // Dry-run populates ast_file_cache without recording a test run.
+        cargo_bin_cmd!("failcast")
+            .current_dir(tmp.path())
+            .args(["run", "--budget", "5", "--dry-run", "--json"])
+            .assert()
+            .success();
+
+        let db_path = tmp.path().join(".failcast").join("store.db");
+        let conn = Connection::open(&db_path).expect("open store.db");
+        let runs_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM runs", [], |r| r.get(0))
+            .expect("count runs");
+        assert_eq!(runs_count, 0, "dry-run must not write runs");
+
+        let cached_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ast_file_cache", [], |r| r.get(0))
+            .expect("count ast_file_cache");
+        assert_eq!(cached_count, 3, "all 3 .py files must be cached");
+        drop(conn);
+
+        // Second invocation hits 100% cache (0 tree-sitter parses) and matches cold build.
+        let mut store = Store::open(&db_path).expect("open store");
+        store.migrate().expect("migrate");
+        let cold_1 = PythonImportGraphBuilder::new()
+            .build(tmp.path())
+            .expect("cold build 1");
+        let res_1 = build_import_graph_with_store(tmp.path(), &mut store).expect("cached build 1");
+        assert_eq!(
+            res_1.parsed_files, 0,
+            "second invocation must parse 0 files"
+        );
+        assert_eq!(res_1.cached_files, 3);
+        assert_eq!(res_1.graph, cold_1);
+        drop(store);
+
+        // Add src/helper.py, import it from src/calc.py, commit, then edit src/helper.py.
+        fs::write(
+            tmp.path().join("src/helper.py"),
+            "def scale(v: int) -> int:\n    return v * 2\n",
+        )
+        .expect("write helper.py");
+        let orig_calc = fs::read_to_string(tmp.path().join("src/calc.py")).expect("read calc.py");
+        fs::write(
+            tmp.path().join("src/calc.py"),
+            format!("from . import helper\n\n{orig_calc}"),
+        )
+        .expect("update calc.py");
+        git_cmd(tmp.path(), &["add", "."]);
+        git_cmd(tmp.path(), &["commit", "-m", "add helper module"]);
+        fs::write(
+            tmp.path().join("src/helper.py"),
+            "def scale(v: int) -> int:\n    return v * 3\n",
+        )
+        .expect("modify helper.py");
+
+        let explain_out = cargo_bin_cmd!("failcast")
+            .current_dir(tmp.path())
+            .args(["explain", "tests/test_calc.py::test_add_positive", "--json"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let explain_json: serde_json::Value =
+            serde_json::from_slice(&explain_out).expect("parse explain json");
+        assert_eq!(
+            explain_json["features"]["ast_min_hop"],
+            serde_json::json!(2.0),
+            "test_calc.py -> src/calc.py -> src/helper.py must be 2 AST hops"
+        );
+
+        let conn = Connection::open(&db_path).expect("open store.db");
+        let cached_count_after_add: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ast_file_cache", [], |r| r.get(0))
+            .expect("count ast_file_cache after add");
+        assert_eq!(cached_count_after_add, 4);
+        drop(conn);
+
+        // Delete src/helper.py and verify pruning + accurate graph update.
+        fs::remove_file(tmp.path().join("src/helper.py")).expect("delete helper.py");
+        fs::write(tmp.path().join("src/calc.py"), orig_calc).expect("restore calc.py");
+
+        cargo_bin_cmd!("failcast")
+            .current_dir(tmp.path())
+            .args(["run", "--budget", "5", "--dry-run", "--json"])
+            .assert()
+            .success();
+
+        let conn = Connection::open(&db_path).expect("open store.db");
+        let cached_paths: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT file_path FROM ast_file_cache ORDER BY file_path ASC")
+                .expect("prepare paths");
+            stmt.query_map([], |r| r.get(0))
+                .expect("query paths")
+                .map(|r| r.expect("path"))
+                .collect()
+        };
+        assert_eq!(
+            cached_paths,
+            vec![
+                "src/__init__.py".to_string(),
+                "src/calc.py".to_string(),
+                "tests/test_calc.py".to_string(),
+            ],
+            "deleted helper.py must be pruned from ast_file_cache"
+        );
+        drop(conn);
+
+        let mut store = Store::open(&db_path).expect("reopen store");
+        let cold_2 = PythonImportGraphBuilder::new()
+            .build(tmp.path())
+            .expect("cold build 2");
+        let res_2 = build_import_graph_with_store(tmp.path(), &mut store).expect("cached build 2");
+        assert_eq!(res_2.parsed_files, 0);
+        assert_eq!(res_2.cached_files, 3);
+        assert_eq!(res_2.graph, cold_2);
+    }
 }

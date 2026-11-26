@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::fs;
 use std::path::Path;
+use std::time::UNIX_EPOCH;
 
 use failcast_core::{FailcastError, normalize_posix_path};
+use serde::{Deserialize, Serialize};
 use tree_sitter::{Node, Parser};
 
 const IGNORED_DIRS: &[&str] = &[
@@ -106,6 +108,25 @@ pub trait ImportGraphBuilder: Send + Sync {
     fn build(&self, repo_root: &Path) -> Result<ImportGraph, FailcastError>;
 }
 
+/// Cached raw Python import payload for a single file, keyed by `(file_size, mtime_ns)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedAstFile {
+    pub file_path: String,
+    pub file_size: u64,
+    pub mtime_ns: i64,
+    pub imports_json: String,
+}
+
+/// Output of an incremental AST import graph build against a persisted file cache.
+#[derive(Debug, Clone)]
+pub struct CachedImportGraphResult {
+    pub graph: ImportGraph,
+    pub upserts: Vec<CachedAstFile>,
+    pub deleted_paths: Vec<String>,
+    pub parsed_files: usize,
+    pub cached_files: usize,
+}
+
 /// Tree-sitter backed Python import graph builder supporting `import a.b`,
 /// `from a.b import c`, relative imports (`.`, `..`), `__init__.py` packages,
 /// and both root and `src/` repository layouts.
@@ -115,6 +136,100 @@ pub struct PythonImportGraphBuilder;
 impl PythonImportGraphBuilder {
     pub fn new() -> Self {
         Self
+    }
+
+    /// Builds an `ImportGraph` incrementally using `existing_cache`.
+    ///
+    /// Unchanged files (matching both `file_size` and `mtime_ns`) reuse their cached raw
+    /// `ParsedImport` list without invoking `tree-sitter`, while edges are resolved against the
+    /// live repository file set so adding or deleting sibling `.py` files updates hops accurately.
+    pub fn build_with_cache(
+        &self,
+        repo_root: &Path,
+        existing_cache: &BTreeMap<String, CachedAstFile>,
+    ) -> Result<CachedImportGraphResult, FailcastError> {
+        let mut files_with_meta = BTreeMap::new();
+        collect_python_files_with_meta(repo_root, repo_root, &mut files_with_meta)?;
+
+        let py_files: BTreeSet<String> = files_with_meta.keys().cloned().collect();
+        let module_index = build_module_index(&py_files);
+
+        let mut parser: Option<Parser> = None;
+        let mut graph = ImportGraph::new();
+        let mut upserts = Vec::new();
+        let mut parsed_files = 0usize;
+        let mut cached_files = 0usize;
+
+        for (rel_path, &(file_size, mtime_ns)) in &files_with_meta {
+            let cached_imports = existing_cache
+                .get(rel_path)
+                .filter(|entry| entry.file_size == file_size && entry.mtime_ns == mtime_ns)
+                .and_then(|entry| {
+                    serde_json::from_str::<Vec<ParsedImport>>(&entry.imports_json).ok()
+                });
+
+            let imports = if let Some(imports) = cached_imports {
+                cached_files += 1;
+                imports
+            } else {
+                let abs_path = repo_root.join(rel_path);
+                let source = match fs::read_to_string(&abs_path) {
+                    Ok(text) => text,
+                    Err(_) => continue,
+                };
+
+                let ts_parser = match parser.as_mut() {
+                    Some(p) => p,
+                    None => {
+                        let mut p = Parser::new();
+                        p.set_language(&tree_sitter_python::LANGUAGE.into())
+                            .map_err(|e| {
+                                FailcastError::Parse(format!(
+                                    "failed to load tree-sitter-python: {e}"
+                                ))
+                            })?;
+                        parser.insert(p)
+                    }
+                };
+
+                let Some(tree) = ts_parser.parse(&source, None) else {
+                    continue;
+                };
+
+                parsed_files += 1;
+                let imports = extract_imports_from_tree(tree.root_node(), source.as_bytes());
+                let imports_json = serde_json::to_string(&imports).map_err(|e| {
+                    FailcastError::Parse(format!("failed to serialize AST imports: {e}"))
+                })?;
+                upserts.push(CachedAstFile {
+                    file_path: rel_path.clone(),
+                    file_size,
+                    mtime_ns,
+                    imports_json,
+                });
+                imports
+            };
+
+            for stmt in imports {
+                for target in resolve_import(rel_path, &stmt, &module_index, &py_files) {
+                    graph.add_edge(rel_path.clone(), target);
+                }
+            }
+        }
+
+        let deleted_paths = existing_cache
+            .keys()
+            .filter(|path| !files_with_meta.contains_key(*path))
+            .cloned()
+            .collect();
+
+        Ok(CachedImportGraphResult {
+            graph,
+            upserts,
+            deleted_paths,
+            parsed_files,
+            cached_files,
+        })
     }
 }
 
@@ -153,7 +268,7 @@ impl ImportGraphBuilder for PythonImportGraphBuilder {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum ParsedImport {
     /// `import a.b` or `import a.b as c`
     Module(String),
@@ -195,6 +310,50 @@ fn collect_python_files(
                 .to_string_lossy()
                 .to_string();
             out.insert(normalize_posix_path(&rel));
+        }
+    }
+
+    Ok(())
+}
+
+fn collect_python_files_with_meta(
+    repo_root: &Path,
+    dir: &Path,
+    out: &mut BTreeMap<String, (u64, i64)>,
+) -> Result<(), FailcastError> {
+    let entries = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if dir == repo_root => return Err(e.into()),
+        Err(_) => return Ok(()),
+    };
+
+    for entry in entries {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        if file_type.is_dir() {
+            if IGNORED_DIRS.contains(&name_str.as_ref()) {
+                continue;
+            }
+            collect_python_files_with_meta(repo_root, &entry.path(), out)?;
+        } else if file_type.is_file() && name_str.ends_with(".py") {
+            let rel = entry
+                .path()
+                .strip_prefix(repo_root)
+                .map_err(|e| FailcastError::Parse(format!("failed to strip repo root: {e}")))?
+                .to_string_lossy()
+                .to_string();
+            let meta = entry.metadata()?;
+            let file_size = meta.len();
+            let mtime_ns = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos().min(i64::MAX as u128) as i64)
+                .unwrap_or(0);
+            out.insert(normalize_posix_path(&rel), (file_size, mtime_ns));
         }
     }
 

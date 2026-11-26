@@ -6,8 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use failcast_collectors::{
-    ImportGraphBuilder, PythonImportGraphBuilder, TempGitWorktree, is_git_repo,
-    mine_commit_history, mine_commit_history_from_ref,
+    TempGitWorktree, is_git_repo, mine_commit_history, mine_commit_history_from_ref,
 };
 use failcast_core::{
     Config, DiffFile, DiffSummary, FailcastError, RunMode, SelectionReason, TestCase, TestRunner,
@@ -23,9 +22,9 @@ use uuid::Uuid;
 
 use crate::mcp;
 use crate::service::{
-    ExplainReport, MODEL_ARTIFACT_REL_PATH, RunExecutionReport, SelectionRequest, current_unix_ts,
-    explain_test, normalize_diff_files, populate_ast_hops, run_selected_tests,
-    select_for_working_tree, truncate_chars,
+    ExplainReport, MODEL_ARTIFACT_REL_PATH, RunExecutionReport, SelectionRequest,
+    build_import_graph_with_store, current_unix_ts, explain_test, normalize_diff_files,
+    populate_ast_hops, run_selected_tests, select_for_working_tree, truncate_chars,
 };
 
 #[derive(Debug, Parser)]
@@ -308,7 +307,7 @@ fn cmd_train(repo_root: &Path) -> Result<()> {
         return Err(FailcastError::NotInitialized.into());
     }
 
-    let store = Store::open(&db_path)?;
+    let mut store = Store::open(&db_path)?;
     store.migrate()?;
 
     let mut runs = store.load_historical_runs()?;
@@ -320,7 +319,7 @@ fn cmd_train(repo_root: &Path) -> Result<()> {
         );
     }
 
-    let graph = PythonImportGraphBuilder::new().build(repo_root)?;
+    let graph = build_import_graph_with_store(repo_root, &mut store)?.graph;
     populate_ast_hops(&mut runs, &graph);
 
     let trained_at = current_unix_ts();
@@ -403,12 +402,12 @@ fn cmd_eval(repo_root: &Path, args: EvalArgs) -> Result<()> {
     let budget_fractions = parse_budgets(&args.budgets)?;
     let config = Config::load(repo_root)?;
 
-    let store = Store::open(&db_path)?;
+    let mut store = Store::open(&db_path)?;
     store.migrate()?;
 
     let mut runs = store.load_historical_runs()?;
     let commits = store.load_commits()?;
-    let graph = PythonImportGraphBuilder::new().build(repo_root)?;
+    let graph = build_import_graph_with_store(repo_root, &mut store)?.graph;
     populate_ast_hops(&mut runs, &graph);
 
     let wf_config = WalkForwardConfig {

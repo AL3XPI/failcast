@@ -1,6 +1,8 @@
 pub mod store;
 
-pub use store::{ModelRecord, RunBatchEntry, RunRecord, Store, TestOutcomeRecord, TestRecord};
+pub use store::{
+    AstFileCacheEntry, ModelRecord, RunBatchEntry, RunRecord, Store, TestOutcomeRecord, TestRecord,
+};
 
 #[cfg(test)]
 pub mod tests {
@@ -54,6 +56,7 @@ pub mod tests {
             "test_outcomes",
             "models",
             "repo_meta",
+            "ast_file_cache",
         ]
         .into_iter()
         .map(String::from)
@@ -70,7 +73,7 @@ pub mod tests {
                 .map(|r| r.expect("version row"))
                 .collect()
         };
-        assert_eq!(versions, vec![1, 2]);
+        assert_eq!(versions, vec![1, 2, 3]);
 
         let mut store = Store::open(&db_path).expect("reopen store");
         assert_eq!(
@@ -431,5 +434,75 @@ pub mod tests {
         assert_eq!(th_250.median_duration_ms, Some(260.0));
         assert!((th_250.flakiness_rate - 1.0).abs() < 1e-12);
         assert_eq!(th_250.last_run_ts, Some(200));
+    }
+
+    #[test]
+    fn ast_file_cache_load_upsert_and_prune() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("store.db");
+
+        let mut store = Store::open(&db_path).expect("open store");
+        store.migrate().expect("migrate");
+
+        assert!(
+            store
+                .load_ast_file_cache()
+                .expect("initial load")
+                .is_empty()
+        );
+        store
+            .sync_ast_file_cache(&[], &[])
+            .expect("empty sync no-op");
+
+        let initial = vec![
+            AstFileCacheEntry {
+                file_path: "src/a.py".to_string(),
+                file_size: 42,
+                mtime_ns: 1_700_000_000_123,
+                imports_json: r#"[{"Module":"pkg.b"}]"#.to_string(),
+            },
+            AstFileCacheEntry {
+                file_path: "tests/test_a.py".to_string(),
+                file_size: 84,
+                mtime_ns: 1_700_000_000_456,
+                imports_json: "[]".to_string(),
+            },
+        ];
+        store
+            .upsert_ast_file_cache(&initial)
+            .expect("upsert initial entries");
+
+        let loaded = store.load_ast_file_cache().expect("load after upsert");
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded.get("src/a.py"), Some(&initial[0]));
+        assert_eq!(loaded.get("tests/test_a.py"), Some(&initial[1]));
+
+        let updated = AstFileCacheEntry {
+            file_path: "src/a.py".to_string(),
+            file_size: 55,
+            mtime_ns: 1_700_000_001_000,
+            imports_json: r#"[{"Module":"pkg.c"}]"#.to_string(),
+        };
+        store
+            .sync_ast_file_cache(
+                std::slice::from_ref(&updated),
+                &["tests/test_a.py".to_string()],
+            )
+            .expect("sync update and prune");
+
+        let after_sync = store.load_ast_file_cache().expect("load after sync");
+        assert_eq!(after_sync.len(), 1);
+        assert_eq!(after_sync.get("src/a.py"), Some(&updated));
+        assert!(!after_sync.contains_key("tests/test_a.py"));
+
+        store
+            .prune_ast_file_cache(&["src/a.py".to_string()])
+            .expect("prune remaining");
+        assert!(
+            store
+                .load_ast_file_cache()
+                .expect("load after prune")
+                .is_empty()
+        );
     }
 }

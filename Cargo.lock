@@ -389,7 +389,7 @@ dependencies = [
 
 [[package]]
 name = "failcast"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -416,9 +416,11 @@ dependencies = [
 
 [[package]]
 name = "failcast-collectors"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "failcast-core",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "tree-sitter",
@@ -427,7 +429,7 @@ dependencies = [
 
 [[package]]
 name = "failcast-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "sha2 0.10.9",
@@ -438,7 +440,7 @@ dependencies = [
 
 [[package]]
 name = "failcast-eval"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "failcast-core",
  "failcast-ml",
@@ -448,7 +450,7 @@ dependencies = [
 
 [[package]]
 name = "failcast-ml"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "failcast-core",
  "failcast-store",
@@ -460,7 +462,7 @@ dependencies = [
 
 [[package]]
 name = "failcast-runners"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "failcast-core",
  "quick-xml",
@@ -470,7 +472,7 @@ dependencies = [
 
 [[package]]
 name = "failcast-store"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "failcast-core",
  "rusqlite",

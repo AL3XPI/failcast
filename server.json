@@ -3,7 +3,7 @@
   "name": "io.github.AL3XPI/failcast",
   "title": "Failcast",
   "description": "Local Rust CLI and MCP server that predicts which pytest tests will fail for a git diff",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "repository": {
     "url": "https://github.com/AL3XPI/failcast",
     "source": "github"
@@ -12,7 +12,7 @@
     {
       "registryType": "pypi",
       "identifier": "failcast",
-      "version": "0.1.1",
+      "version": "0.1.2",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"
